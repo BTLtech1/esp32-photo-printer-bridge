@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.5.1   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.5.2   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -44,7 +44,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.5.1"
+#define FW_VERSION    "0.5.2"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -1987,18 +1987,15 @@ static bool connectWifi() {
       return false;
     }
   }
-  Serial.print("Connecting to Wi-Fi");
+  Serial.println("Connecting to Wi-Fi");          // no dots: they'd hide the installer's replies
   uint32_t t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) {   // answer the installer while waiting
-    for (int i = 0; i < 30; i++) { serviceImprov(); delay(10); }
-    Serial.print(".");
-  }
-  Serial.println();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) { serviceImprov(); delay(10); }
   return WiFi.status() == WL_CONNECTED;
 }
 
 static void startSetupPortal() {
   setupMode = true;
+  serviceImprov();
   WiFi.mode(WIFI_AP_STA);
   int n = WiFi.scanNetworks();
   for (int i = 0; i < n; i++) { String s = WiFi.SSID(i); if (s.length()) scannedNets.push_back(s); }

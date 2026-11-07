@@ -10,6 +10,7 @@
 // Packet: "IMPROV" <version 1> <type> <length> <data...> <checksum> '\n'
 // checksum = low byte of the sum of every byte before it. The newline is not part of
 // the packet; the installer reads it as a line break (same as ESPHome does).
+// A newline is also sent BEFORE each packet (see sendPacket).
 
 #pragma once
 #include <Arduino.h>
@@ -167,8 +168,12 @@ private:
     sendPacket(TYPE_RPC_RESULT, out, (uint8_t)n);
   }
 
+  // The installer only spots a packet at the start of a line, and the bridge prints its
+  // log on the same port, so every packet starts with its own newline.
   void sendPacket(uint8_t type, const uint8_t *data, uint8_t len) {
-    uint8_t pkt[9 + 255 + 2];
+    uint8_t buf[1 + 9 + 255 + 2];
+    buf[0] = '\n';
+    uint8_t *pkt = buf + 1;
     memcpy(pkt, "IMPROV", 6);
     pkt[6] = 1;            // protocol version
     pkt[7] = type;
@@ -178,6 +183,6 @@ private:
     for (uint16_t i = 0; i < 9 + len; i++) sum += pkt[i];
     pkt[9 + len] = sum;
     pkt[10 + len] = '\n';
-    io.write(pkt, 11 + len);  // in one write, so the packet goes out in one piece
+    io.write(buf, 12 + len);  // in one write, so the packet goes out in one piece
   }
 };
