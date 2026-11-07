@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.7.3   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.7.4   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.7.3"
+#define FW_VERSION    "0.7.4"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -347,12 +347,15 @@ static uint32_t rd32(const uint8_t* p) {
   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
-// Turns an IPP response into "name = value" lines. Returns the IPP status code.
+// Turns an IPP response into "name = value" lines (collection members as "name.member = value").
+// Returns the IPP status code.
 static uint16_t parseIpp(const std::vector<uint8_t>& d, String* out) {
   if (d.size() < 8) return 0xFFFF;
   uint16_t status = (d[2] << 8) | d[3];
   size_t p = 8, n = d.size();
-  int depth = 0;
+  String path[6]; int depth = 0;                        // collection nesting
+  String member;                                        // pending member name inside a collection
+  String lastTop;                                       // name of the attribute currently being listed (for extra values)
   while (p < n) {
     uint8_t tag = d[p++];
     if (tag == 0x03) break;
@@ -366,18 +369,23 @@ static uint16_t parseIpp(const std::vector<uint8_t>& d, String* out) {
     uint16_t vl = (d[p] << 8) | d[p + 1]; p += 2;
     if (p + vl > n) break;
     const uint8_t* v = &d[p]; p += vl;
-    if (tag == 0x34) { depth++; continue; }
-    if (tag == 0x37) { if (depth > 0) depth--; continue; }
-    if (depth > 0 || !out) continue;
+    if (!out) continue;
+    if (tag == 0x4A) { member = ""; for (uint16_t i = 0; i < vl; i++) member += (char)v[i]; continue; }   // memberAttrName
+    String full = name.length() ? name : member;
+    if (depth > 0 && depth < 6) full = path[depth - 1] + "." + full;
+    if (tag == 0x34) { if (depth < 6) path[depth] = full; depth++; member = ""; continue; }   // begCollection
+    if (tag == 0x37) { if (depth > 0) depth--; member = ""; continue; }                      // endCollection
     String s;
     if ((tag == 0x21 || tag == 0x23) && vl == 4) s = String((int32_t)rd32(v));
     else if (tag == 0x22 && vl == 1) s = v[0] ? "true" : "false";
     else if (tag == 0x32 && vl == 9) s = String((int32_t)rd32(v)) + "x" + String((int32_t)rd32(v + 4)) + (v[8] == 3 ? " dpi" : " dpcm");
     else if (tag == 0x33 && vl == 8) s = String((int32_t)rd32(v)) + "-" + String((int32_t)rd32(v + 4));
     else if (tag >= 0x40) { uint16_t m = vl > 160 ? 160 : vl; for (uint16_t i = 0; i < m; i++) s += (char)v[i]; }
-    else continue;
-    if (name.length()) *out += "\n" + name + " = " + s;
-    else *out += ", " + s;
+    else if (tag == 0x13) s = "no-value";
+    else { s = "(tag 0x" + String(tag, HEX) + ", " + String(vl) + " bytes)"; }
+    if (name.length() || depth > 0) { *out += "\n" + full + " = " + s; lastTop = full; }
+    else *out += ", " + s;                                // another value of the same attribute
+    if (depth > 0) member = "";
   }
   return status;
 }
@@ -2481,7 +2489,9 @@ static void handlePrinterInfo() {
       "media-default", "media-ready", "media-supported", "media-type-supported", "media-source-supported",
       "print-scaling-default", "print-scaling-supported", "printer-resolution-default", "printer-resolution-supported",
       "print-quality-default", "print-quality-supported", "print-color-mode-supported", "media-bottom-margin-supported",
-      "media-top-margin-supported", "media-left-margin-supported", "media-right-margin-supported", "job-creation-attributes-supported" };
+      "media-top-margin-supported", "media-left-margin-supported", "media-right-margin-supported", "job-creation-attributes-supported",
+      "media-col-default", "media-col-database", "media-size-supported", "marker-names", "marker-levels", "marker-types",
+      "printer-alert", "printer-alert-description", "printer-supply", "printer-supply-description", "printer-input-tray", "printer-output-tray" };
     for (auto a : want) putAttrMore(req, 0x44, a);
     put8(req, 0x03);
     uint32_t t0 = millis();
