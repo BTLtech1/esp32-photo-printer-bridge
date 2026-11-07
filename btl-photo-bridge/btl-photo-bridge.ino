@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.0   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.1   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -15,6 +15,7 @@
 
   Building it yourself in Arduino IDE (plug the board's UART port into the computer):
     Boards Manager: esp32 by Espressif, version 3.1.1 (newer 3.3.x versions don't connect USB printers yet)
+    Library: copy libraries/esp_new_jpeg (from the repository) into your sketchbook's libraries folder
     Board: ESP32S3 Dev Module   |   USB CDC On Boot: Disabled   |   USB Mode: Hardware CDC and JTAG
     PSRAM: OPI PSRAM (N16R8 boards)
   (With USB CDC On Boot: Enabled it still works, but over Wi-Fi only.)
@@ -24,7 +25,7 @@
   (set from the web installer, or from its page at http://192.168.4.1) for the printer over Wi-Fi
   and for reaching its page from your normal network.
 
-  MIT License. Made by BTL. JPEG decoding uses TJpgDec (C)ChaN, see btl_tjpgd.c.
+  MIT License. Made by BTL. JPEG: Espressif's esp_new_jpeg (precompiled, see libraries/), TJpgDec (C)ChaN as fallback.
 */
 
 #include <WiFi.h>
@@ -37,7 +38,9 @@
 #include <vector>
 #include <deque>
 #include "img_converters.h"   // JPEG encoder from the ESP32 core
-#include "btl_tjpgd.h"        // JPEG decoder (TJpgDec)
+#include "btl_tjpgd.h"        // JPEG decoder (TJpgDec): fallback
+#include "esp_jpeg_dec.h"     // Espressif's fast JPEG codec (libraries/esp_new_jpeg): the normal path
+#include "esp_jpeg_enc.h"
 #include "usb/usb_host.h"     // USB host (printer on the board's USB port)
 #include "freertos/stream_buffer.h"
 #include "soc/soc.h"
@@ -45,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.0"
+#define FW_VERSION    "0.6.1"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -126,6 +129,7 @@ struct ShrinkJob {
   size_t rxBytes = 0;
   uint32_t rxFirstMs = 0, rxLastMs = 0, waitMs = 0;
   int cx0 = 0, cy0 = 0, cw = 0, ch = 0;   // the part of the (scaled) source that goes onto the print
+  float kScale = 1.0f;           // output size / source size
   uint32_t tDecode = 0;
   // Area-weighted (box) resampling: each source pixel covers part of one or two output pixels.
   // ox0/oy0 = first output pixel it lands in, wx0/wy0 = how much of it lands there (out of tw/th).
@@ -139,6 +143,15 @@ struct ShrinkJob {
   size_t outCap = 0;
   bool outFail = false;
   TaskHandle_t waiter = nullptr;
+  // fast path (Espressif codec): whole file in memory, output rows go band by band into the encoder
+  uint8_t* whole = nullptr;      // the JPEG received into PSRAM (owned; handed back to the caller if not shrunk)
+  size_t wholeCap = 0;
+  uint8_t* bandOut = nullptr;    // one encoder block of finished output rows (RGB)
+  int bandRows = 0;
+  size_t bandBytes = 0;
+  void* enc = nullptr;
+  bool encFail = false;
+  uint32_t tRecv = 0, tDec = 0, tEnc = 0;
 };
 std::deque<Job>     jobs;
 std::deque<String>  logLines;
@@ -1323,18 +1336,38 @@ static void shrinkFinalizeRow(ShrinkJob* j, int oy) {
   for (int ox = 0; ox < j->tw; ox++) {
     const uint32_t* sm = row + ox * 3;
     int dx, dy;
-    switch (j->orient) {
+    switch (j->bandOut ? 1 : j->orient) {                            // fast path: no rotation
       case 3:  dx = j->tw - 1 - ox; dy = j->th - 1 - oy; break;   // upside down
       case 6:  dx = j->th - 1 - oy; dy = ox;               break;   // rotate 90 clockwise
       case 8:  dx = oy;             dy = j->tw - 1 - ox;   break;   // rotate 90 counter-clockwise
       default: dx = ox;             dy = oy;
     }
-    uint8_t* f = j->frame + ((size_t)dy * j->fw + dx) * 3;          // encoder wants B, G, R
-    f[0] = (sm[2] + D / 2) / D;
-    f[1] = (sm[1] + D / 2) / D;
-    f[2] = (sm[0] + D / 2) / D;
+    if (j->bandOut) {                                                  // fast path: R, G, B into the band
+      uint8_t* f = j->bandOut + ((size_t)(oy % j->bandRows) * j->fw + dx) * 3;
+      f[0] = (sm[0] + D / 2) / D;
+      f[1] = (sm[1] + D / 2) / D;
+      f[2] = (sm[2] + D / 2) / D;
+    } else {
+      uint8_t* f = j->frame + ((size_t)dy * j->fw + dx) * 3;          // old encoder wants B, G, R
+      f[0] = (sm[2] + D / 2) / D;
+      f[1] = (sm[1] + D / 2) / D;
+      f[2] = (sm[0] + D / 2) / D;
+    }
   }
   memset(row, 0, (size_t)j->tw * 3 * sizeof(uint32_t));
+  if (j->bandOut && !j->encFail && ((oy + 1) % j->bandRows == 0 || oy == j->th - 1)) {
+    if (oy == j->th - 1) {                                             // last band may be partial: repeat the last row
+      int have = oy % j->bandRows + 1;
+      for (int r = have; r < j->bandRows; r++)
+        memcpy(j->bandOut + (size_t)r * j->fw * 3, j->bandOut + (size_t)(have - 1) * j->fw * 3, (size_t)j->fw * 3);
+    }
+    uint32_t t = millis();
+    int outLen = 0;
+    // returns the block size while there's more to come, JPEG_ERR_OK (0) after the last block, negative on error
+    int r = (int)jpeg_enc_process_with_block((jpeg_enc_handle_t)j->enc, j->bandOut, (int)j->bandBytes, j->out, (int)j->outCap, &outLen);
+    if (r < 0) j->encFail = true; else j->outLen = (size_t)outLen;
+    j->tEnc += millis() - t;
+  }
 }
 
 static void shrinkFinalizeUntil(ShrinkJob* j, int limit) {
@@ -1410,9 +1443,155 @@ static size_t shrinkJpgOut(void* arg, size_t index, const void* data, size_t len
   return len;
 }
 
+// Pulls the rest of the photo into PSRAM so the fast decoder can work on the whole file.
+// Leaves room for the decoder, the encoder and the print queue; a file that doesn't fit is
+// passed on to the streaming path with whatever was received so far.
+static bool shrinkReceiveWhole(ShrinkJob* j) {
+  if (!j->d || j->eof) return true;                     // already complete in memory
+  size_t room = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  if (room < 2 * 1024 * 1024) return false;
+  size_t cap = min(room - 1536 * 1024, (size_t)(5 * 1024 * 1024));
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) return false;
+  memcpy(buf, j->hb, j->hn);
+  size_t n = j->hn;
+  bool full = false;
+  uint32_t t0 = millis();
+  while (true) {
+    if (n >= cap) { full = true; break; }
+    int got = readSome(*j->d, buf + n, cap - n, 30000);
+    if (got < 0) { j->err = true; j->eof = true; break; }
+    if (got == 0) { j->eof = true; break; }
+    if (!j->rxFirstMs) j->rxFirstMs = millis();
+    n += got; j->rxBytes += got; j->rxLastMs = millis();
+  }
+  j->tRecv = millis() - t0;
+  j->whole = buf; j->wholeCap = cap; j->hb = buf; j->hn = n; j->pos = 0;
+  j->sockBytes = 0;                                     // hn now covers everything received so far
+  if (full) return false;                               // too big for the fast path: streaming path continues from the socket
+  return !j->err;
+}
+
+static void shrinkFreeWhole(ShrinkJob* j) { free(j->whole); j->whole = nullptr; }
+
+static bool shrinkPrepareResampler(ShrinkJob* j);       // below
+static void shrinkFreeWork(ShrinkJob* j);
+
+// Fast path: Espressif's codec decodes the file (in memory) a block row at a time straight into the
+// box resampler; finished output rows are encoded band by band. No rotation: the printer turns the
+// sheet to fit, so a photo stored sideways prints the same either way.
+// Returns false (with nothing consumed) when the standard path should be used instead.
+static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
+  if (j->iw % 8 || j->ih % 8) return false;
+  j->s = 0; j->sw = j->iw; j->sh = j->ih;
+  int cwF = min(j->iw, max(j->tw, (int)lroundf(j->tw / j->kScale)));
+  int chF = min(j->ih, max(j->th, (int)lroundf(j->th / j->kScale)));
+  j->cw = cwF; j->ch = chF; j->cx0 = (j->sw - j->cw) / 2; j->cy0 = (j->sh - j->ch) / 2;
+  j->fw = j->tw; j->fh = j->th;
+
+  jpeg_dec_config_t dc = {};
+  dc.output_type = JPEG_PIXEL_FORMAT_RGB888; dc.rotate = JPEG_ROTATE_0D; dc.block_enable = true;
+  jpeg_dec_handle_t dec = nullptr;
+  if (jpeg_dec_open(&dc, &dec) != JPEG_ERR_OK || !dec) return false;
+  jpeg_dec_io_t io = {};
+  io.inbuf = (uint8_t*)j->hb; io.inbuf_len = (int)j->hn; io.inbuf_remain = (int)j->hn;
+  jpeg_dec_header_info_t hi = {};
+  int blkLen = 0, count = 0;
+  if (jpeg_dec_parse_header(dec, &io, &hi) != JPEG_ERR_OK || hi.width != j->iw || hi.height != j->ih ||
+      jpeg_dec_get_outbuf_len(dec, &blkLen) != JPEG_ERR_OK || blkLen < j->iw * 3 ||
+      jpeg_dec_get_process_count(dec, &count) != JPEG_ERR_OK || count < 1) {
+    jpeg_dec_close(dec); return false;
+  }
+  uint8_t* blk = (uint8_t*)heap_caps_aligned_alloc(16, blkLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!blk) { jpeg_dec_close(dec); return false; }
+  io.outbuf = blk;
+
+  jpeg_enc_config_t ec = {};
+  ec.width = j->fw; ec.height = j->fh; ec.src_type = JPEG_PIXEL_FORMAT_RGB888; ec.subsampling = JPEG_SUBSAMPLE_420;
+  ec.quality = j->quality; ec.rotate = JPEG_ROTATE_0D; ec.task_enable = false; ec.hfm_task_priority = 13; ec.hfm_task_core = 1;
+  jpeg_enc_handle_t enc = nullptr;
+  if (jpeg_enc_open(&ec, &enc) != JPEG_ERR_OK || !enc) { free(blk); jpeg_dec_close(dec); return false; }
+  int bs = jpeg_enc_get_block_size(enc);
+  if (bs <= 0 || bs % (j->fw * 3)) { jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false; }
+  j->bandRows = bs / (j->fw * 3); j->bandBytes = bs;
+  j->bandOut = (uint8_t*)heap_caps_aligned_alloc(16, bs, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  j->outCap = 1536 * 1024;
+  j->out = (uint8_t*)bigAlloc(j->outCap);
+  j->enc = enc;
+  if (!j->bandOut || !j->out || !shrinkPrepareResampler(j)) {
+    shrinkFreeWork(j); free(j->bandOut); j->bandOut = nullptr; free(j->out); j->out = nullptr; j->outCap = 0; j->enc = nullptr;
+    jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false;
+  }
+
+  uint32_t t1 = millis();
+  int y = 0;
+  jpeg_error_t r = JPEG_ERR_OK;
+  for (int b = 0; b < count; b++) {
+    r = jpeg_dec_process(dec, &io);
+    if (r != JPEG_ERR_OK) break;
+    int rows = io.out_size / (j->iw * 3);
+    for (int k = 0; k < rows && y < j->ih; k++, y++) shrinkSourceRow(j, y, blk + (size_t)k * j->iw * 3);
+    if (j->encFail) break;
+    vTaskDelay(1);                                      // let the web page and printer tasks run
+  }
+  bool ok = r == JPEG_ERR_OK && y == j->ih && !j->encFail;
+  if (ok) shrinkFinalizeUntil(j, j->th);
+  ok = ok && !j->encFail && j->outLen > 0;
+  j->tDec = millis() - t1 - j->tEnc;
+  jpeg_enc_close(enc); j->enc = nullptr;
+  jpeg_dec_close(dec);
+  free(blk);
+  shrinkFreeWork(j);
+  free(j->bandOut); j->bandOut = nullptr;
+  if (!ok) {
+    free(j->out); j->out = nullptr; j->outLen = 0; j->outCap = 0; j->encFail = false; j->base = 0;
+    blog("Fast decoder couldn't handle this photo (error %d at row %d) - using the slow one", (int)r, y);
+    return false;
+  }
+  size_t inBytes = j->hn;
+  char b[200];
+  bool cropped = j->cw < j->sw || j->ch < j->sh;
+  snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (camera %.1f s at %u KB/s, decode+resize %.1f s, encode %.1f s)",
+           j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(), cropped ? " (edges trimmed to fill the paper)" : "",
+           (millis() - t0) / 1000.0, j->tRecv / 1000.0, j->tRecv ? (unsigned)(j->rxBytes / j->tRecv) : 0u, j->tDec / 1000.0, j->tEnc / 1000.0);
+  j->info = b;
+  j->result = 1;
+  return true;
+}
+
 static void shrinkFreeWork(ShrinkJob* j) {
   free(j->ox0); free(j->wx0); free(j->oy0); free(j->wy0); free(j->sums); free(j->hrow); free(j->band); free(j->pool);
   j->ox0 = j->wx0 = j->oy0 = j->wy0 = nullptr; j->sums = j->hrow = nullptr; j->band = nullptr; j->pool = nullptr;
+}
+
+// Mapping tables and accumulators for the box resampler (needs sw, sh, tw, th and the crop set).
+static bool shrinkPrepareResampler(ShrinkJob* j) {
+  j->W = 3;                                             // output rows open at once (row-by-row processing)
+  j->base = 0;
+  j->ox0   = (uint16_t*)bigAlloc((size_t)j->sw * 2);
+  j->wx0   = (uint16_t*)bigAlloc((size_t)j->sw * 2);
+  j->oy0   = (uint16_t*)bigAlloc((size_t)j->sh * 2);
+  j->wy0   = (uint16_t*)bigAlloc((size_t)j->sh * 2);
+  size_t sumBytes = (size_t)j->W * j->tw * 3 * sizeof(uint32_t);
+  j->sums  = (uint32_t*)fastAlloc(sumBytes);
+  j->hrow  = (uint32_t*)fastAlloc((size_t)j->tw * 3 * sizeof(uint32_t));
+  if (!j->ox0 || !j->wx0 || !j->oy0 || !j->wy0 || !j->sums || !j->hrow) return false;
+  memset(j->sums, 0, sumBytes);
+  // Within the crop, source pixel x spans [x*tw, (x+1)*tw) and output pixel o spans [o*cw, (o+1)*cw)
+  // on a common scale. Source pixels outside the crop are skipped (0xFFFF).
+  for (int x = 0; x < j->sw; x++) {
+    if (x < j->cx0 || x >= j->cx0 + j->cw) { j->ox0[x] = 0xFFFF; j->wx0[x] = 0; continue; }
+    uint32_t a = (uint32_t)(x - j->cx0) * j->tw, o = a / j->cw, edge = (o + 1) * (uint32_t)j->cw;
+    j->ox0[x] = o;
+    j->wx0[x] = (a + j->tw <= edge) ? j->tw : (edge - a);
+  }
+  for (int y = 0; y < j->sh; y++) {
+    if (y < j->cy0 || y >= j->cy0 + j->ch) { j->oy0[y] = 0xFFFF; j->wy0[y] = 0; continue; }
+    uint32_t a = (uint32_t)(y - j->cy0) * j->th, o = a / j->ch, edge = (o + 1) * (uint32_t)j->ch;
+    j->oy0[y] = o;
+    j->wy0[y] = (a + j->th <= edge) ? j->th : (edge - a);
+  }
+  return true;
 }
 
 static void shrinkRun(ShrinkJob* j) {
@@ -1430,6 +1609,13 @@ static void shrinkRun(ShrinkJob* j) {
   if (k >= 0.999f) { j->why = "already print size"; return; }
   int tL = j->fill ? pl : max(1, (int)lroundf(L * k)), tS = j->fill ? ps : max(1, (int)lroundf(S * k));
   if (j->iw >= j->ih) { j->tw = tL; j->th = tS; } else { j->tw = tS; j->th = tL; }
+  j->kScale = k;
+
+  // Fast path first: the whole file in memory, Espressif's codec. Falls back to the streaming path below.
+  if (j->iw % 8 == 0 && j->ih % 8 == 0 && shrinkReceiveWhole(j)) {
+    if (shrinkFast(j, t0)) { shrinkFreeWhole(j); return; }
+  }
+
   int cwF = min(j->iw, max(j->tw, (int)lroundf(j->tw / k)));   // source area that ends up on the print
   int chF = min(j->ih, max(j->th, (int)lroundf(j->th / k)));
   j->s = 0;                                             // let the decoder do the first halvings for free
@@ -1439,41 +1625,18 @@ static void shrinkRun(ShrinkJob* j) {
   j->cx0 = (j->sw - j->cw) / 2; j->cy0 = (j->sh - j->ch) / 2;
   bool rot = j->orient == 6 || j->orient == 8;
   j->fw = rot ? j->th : j->tw; j->fh = rot ? j->tw : j->th;
-  j->W = 3;                                             // output rows open at once (row-by-row processing)
   j->bandH = 16 >> j->s; if (j->bandH < 1) j->bandH = 1;
 
   size_t frameBytes = (size_t)j->fw * j->fh * 3;
   if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < frameBytes + 256 * 1024) { j->why = "not enough memory"; return; }
   j->frame = (uint8_t*)heap_caps_malloc(frameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  j->ox0   = (uint16_t*)bigAlloc((size_t)j->sw * 2);
-  j->wx0   = (uint16_t*)bigAlloc((size_t)j->sw * 2);
-  j->oy0   = (uint16_t*)bigAlloc((size_t)j->sh * 2);
-  j->wy0   = (uint16_t*)bigAlloc((size_t)j->sh * 2);
-  size_t sumBytes = (size_t)j->W * j->tw * 3 * sizeof(uint32_t);
-  j->sums  = (uint32_t*)fastAlloc(sumBytes);
-  j->hrow  = (uint32_t*)fastAlloc((size_t)j->tw * 3 * sizeof(uint32_t));
   j->band  = (uint8_t*)bigAlloc((size_t)j->bandH * j->sw * 3);
   const size_t POOL = 32 * 1024;
   j->pool  = malloc(POOL);
   if (!j->pool) j->pool = bigAlloc(POOL);
-  if (!j->frame || !j->ox0 || !j->wx0 || !j->oy0 || !j->wy0 || !j->sums || !j->hrow || !j->band || !j->pool) {
+  if (!j->frame || !j->band || !j->pool || !shrinkPrepareResampler(j)) {
     shrinkFreeWork(j); free(j->frame); j->frame = nullptr;
     j->why = "not enough memory"; return;
-  }
-  memset(j->sums, 0, sumBytes);
-  // Within the crop, source pixel x spans [x*tw, (x+1)*tw) and output pixel o spans [o*cw, (o+1)*cw)
-  // on a common scale. Source pixels outside the crop are skipped (0xFFFF).
-  for (int x = 0; x < j->sw; x++) {
-    if (x < j->cx0 || x >= j->cx0 + j->cw) { j->ox0[x] = 0xFFFF; j->wx0[x] = 0; continue; }
-    uint32_t a = (uint32_t)(x - j->cx0) * j->tw, o = a / j->cw, edge = (o + 1) * (uint32_t)j->cw;
-    j->ox0[x] = o;
-    j->wx0[x] = (a + j->tw <= edge) ? j->tw : (edge - a);
-  }
-  for (int y = 0; y < j->sh; y++) {
-    if (y < j->cy0 || y >= j->cy0 + j->ch) { j->oy0[y] = 0xFFFF; j->wy0[y] = 0; continue; }
-    uint32_t a = (uint32_t)(y - j->cy0) * j->th, o = a / j->ch, edge = (o + 1) * (uint32_t)j->ch;
-    j->oy0[y] = o;
-    j->wy0[y] = (a + j->th <= edge) ? j->th : (edge - a);
   }
 
   shrinkRxStart(j);
@@ -1483,21 +1646,21 @@ static void shrinkRun(ShrinkJob* j) {
     shrinkRxFinish(j, true);
     shrinkFreeWork(j); free(j->frame); j->frame = nullptr;
     j->why = "decoder could not read it (" + String((int)rc) + ")";
-    j->result = j->sockBytes ? -1 : 0;
+    j->result = (j->sockBytes && !j->whole) ? -1 : 0;   // with the file in memory the original is still usable
     return;
   }
   int mcuRows = (jd.msy * 8) >> j->s;                     // block row height: 8 or 16 rows, scaled
   if (mcuRows < 1) mcuRows = 1;
   if (mcuRows > j->bandH) {                               // never: blocks are at most 16 rows tall
     shrinkRxFinish(j, true);
-    shrinkFreeWork(j); free(j->frame); j->frame = nullptr;
+    shrinkFreeWork(j); free(j->frame); j->frame = nullptr; shrinkFreeWhole(j);
     j->why = "unexpected block size"; j->result = -1; return;
   }
   j->bandH = mcuRows;
   rc = jd_decomp(&jd, shrinkOut, j->s);
   if (rc != JDR_OK) {
     shrinkRxFinish(j, true);
-    shrinkFreeWork(j); free(j->frame); j->frame = nullptr;
+    shrinkFreeWork(j); free(j->frame); j->frame = nullptr; shrinkFreeWhole(j);
     j->why = j->err ? String("camera stopped sending") : ("decode error " + String((int)rc));
     j->result = -1;
     return;
@@ -1515,12 +1678,14 @@ static void shrinkRun(ShrinkJob* j) {
   free(j->frame); j->frame = nullptr;
   if (!ok || j->outFail || !j->outLen) {
     free(j->out); j->out = nullptr; j->outLen = 0;
+    shrinkFreeWhole(j);
     j->why = "encoder failed";
     j->result = -1;
     return;
   }
   uint32_t t2 = millis();
   size_t inBytes = j->hn + j->sockBytes;
+  shrinkFreeWhole(j);
   char b[200];
   bool cropped = j->cw < j->sw || j->ch < j->sh;
   if (j->rxBytes)
@@ -1639,6 +1804,9 @@ static String ftpStor(WiFiClient& d, const String& path) {
     ShrinkJob sj;
     sj.hb = hb; sj.hn = hn; sj.d = &d; sj.eof = eof; sj.orient = orient; sj.quality = jpegQ; sj.fast = (speedMode == 1); sj.fill = fillOn;
     shrinkBlocking(&sj);
+    if (sj.whole) {                                     // the resizer pulled the photo into memory: keep using that copy
+      free(hb); hb = sj.whole; hn = sj.hn; hcap = sj.wholeCap; eof = sj.eof; sj.whole = nullptr;
+    }
     if (sj.result == 1) {
       free(hb);
       enqueueJob(sj.out, sj.outLen, name, rating);

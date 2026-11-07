@@ -67,9 +67,10 @@ The bridge's page shows "SELPHY CP1500 (USB cable)" when it's connected, and **C
 ## Build it yourself (Arduino IDE)
 
 1. **Boards Manager:** install **esp32 by Espressif**, version **3.1.1**. The newer 3.3.x versions don't finish connecting USB devices yet.
-2. Open `btl-photo-bridge/btl-photo-bridge.ino`.
-3. **Tools:** Board **ESP32S3 Dev Module**, USB CDC On Boot **Disabled**, USB Mode **Hardware CDC and JTAG**, PSRAM **OPI PSRAM**.
-4. Plug in the board's **UART** port and upload.
+2. Copy the folder `libraries/esp_new_jpeg` from this repository into your sketchbook's `libraries` folder (usually `Documents/Arduino/libraries`). It's Espressif's fast JPEG codec, precompiled for the ESP32-S3.
+3. Open `btl-photo-bridge/btl-photo-bridge.ino`.
+4. **Tools:** Board **ESP32S3 Dev Module**, USB CDC On Boot **Disabled**, USB Mode **Hardware CDC and JTAG**, PSRAM **OPI PSRAM**.
+5. Plug in the board's **UART** port and upload.
 
 ## Troubleshooting
 
@@ -85,7 +86,7 @@ The bridge's page shows "SELPHY CP1500 (USB cable)" when it's connected, and **C
 
 Made by [BTL](https://btlstore.com). I designed and tested this; the code was written with help from AI (Claude).
 
-JPEG decoding uses [TJpgDec](http://elm-chan.org/fsw/tjpgd/) by ChaN.
+JPEG decoding and encoding use Espressif's [esp_new_jpeg](https://github.com/espressif/esp-adf-libs/tree/master/esp_new_jpeg) (precompiled, ESPRESSIF MIT License), with [TJpgDec](http://elm-chan.org/fsw/tjpgd/) by ChaN as the fallback for photos it can't handle.
 
 ## License
 

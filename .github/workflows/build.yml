@@ -35,6 +35,7 @@ jobs:
         run: |
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32s3:CDCOnBoot=default,USBMode=hwcdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" \
+            --library libraries/esp_new_jpeg \
             --export-binaries --output-dir build btl-photo-bridge
           ls -la build
 
