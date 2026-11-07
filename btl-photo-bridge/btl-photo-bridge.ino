@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.5   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.6   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.5"
+#define FW_VERSION    "0.6.6"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -1419,9 +1419,13 @@ static size_t shrinkIn(JDEC* jd, uint8_t* buf, size_t nd) {
   return got;
 }
 
+__attribute__((optimize("O2")))
 static void shrinkFinalizeRow(ShrinkJob* j, int oy) {
   uint32_t* row = j->sums + (size_t)(oy % j->W) * j->tw * 3;
   const uint32_t D = (uint32_t)j->cw * j->ch;          // total weight of every output pixel
+  const uint32_t half = D / 2;
+  const uint64_t inv = ((uint64_t)1 << 40) / D;         // divide by multiplying: (v * inv) >> 40
+  #define SHRINK_DIV(v) ((uint8_t)(((uint64_t)((v) + half) * inv) >> 40))
   for (int ox = 0; ox < j->tw; ox++) {
     const uint32_t* sm = row + ox * 3;
     int dx, dy;
@@ -1433,16 +1437,17 @@ static void shrinkFinalizeRow(ShrinkJob* j, int oy) {
     }
     if (j->bandOut) {                                                  // fast path: R, G, B into the band
       uint8_t* f = j->bandOut + ((size_t)(oy % j->bandRows) * j->fw + dx) * 3;
-      f[0] = (sm[0] + D / 2) / D;
-      f[1] = (sm[1] + D / 2) / D;
-      f[2] = (sm[2] + D / 2) / D;
+      f[0] = SHRINK_DIV(sm[0]);
+      f[1] = SHRINK_DIV(sm[1]);
+      f[2] = SHRINK_DIV(sm[2]);
     } else {
       uint8_t* f = j->frame + ((size_t)dy * j->fw + dx) * 3;          // old encoder wants B, G, R
-      f[0] = (sm[2] + D / 2) / D;
-      f[1] = (sm[1] + D / 2) / D;
-      f[2] = (sm[0] + D / 2) / D;
+      f[0] = SHRINK_DIV(sm[2]);
+      f[1] = SHRINK_DIV(sm[1]);
+      f[2] = SHRINK_DIV(sm[0]);
     }
   }
+  #undef SHRINK_DIV
   memset(row, 0, (size_t)j->tw * 3 * sizeof(uint32_t));
   if (j->bandOut && !j->encFail && ((oy + 1) % j->bandRows == 0 || oy == j->th - 1)) {
     if (oy == j->th - 1) {                                             // last band may be partial: repeat the last row
@@ -1467,26 +1472,33 @@ static void shrinkFinalizeUntil(ShrinkJob* j, int limit) {
 // One decoded source row -> shrink horizontally, add into the output rows it covers, and finish
 // any output rows that can't receive anything more. Works row by row, in order, so memory access
 // stays sequential (the averaging buffers live in fast internal RAM).
+__attribute__((optimize("O2")))
 static void shrinkSourceRow(ShrinkJob* j, int y, const uint8_t* px) {
   if (j->oy0[y] == 0xFFFF) return;                      // outside the crop
   const int n3 = j->tw * 3;
-  uint32_t* h = j->hrow;
+  uint32_t* const h = j->hrow;
   memset(h, 0, (size_t)n3 * sizeof(uint32_t));
-  for (int x = 0; x < j->sw; x++, px += 3) {
-    if (j->ox0[x] == 0xFFFF) continue;
-    uint32_t wa = j->wx0[x], wb = j->tw - wa;
-    uint32_t* a = h + j->ox0[x] * 3;
-    a[0] += px[0] * wa; a[1] += px[1] * wa; a[2] += px[2] * wa;
-    if (wb) { a[3] += px[0] * wb; a[4] += px[1] * wb; a[5] += px[2] * wb; }
+  const uint16_t* ox0 = j->ox0 + j->cx0;
+  const uint16_t* wx0 = j->wx0 + j->cx0;
+  const uint32_t tw = j->tw;
+  px += (size_t)j->cx0 * 3;
+  for (int x = 0; x < j->cw; x++, px += 3) {           // only the cropped part of the row
+    uint32_t wa = wx0[x];
+    uint32_t* a = h + ox0[x] * 3;
+    uint32_t r = px[0], g = px[1], b = px[2];
+    a[0] += r * wa; a[1] += g * wa; a[2] += b * wa;
+    uint32_t wb = tw - wa;
+    if (wb) { a[3] += r * wb; a[4] += g * wb; a[5] += b * wb; }
   }
   int oy = j->oy0[y];
   shrinkFinalizeUntil(j, oy);                           // rows above this one are complete
   uint32_t wa = j->wy0[y], wb = j->th - wa;
   uint32_t* ra = j->sums + (size_t)(oy % j->W) * n3;
-  for (int i = 0; i < n3; i++) ra[i] += h[i] * wa;
   if (wb) {
     uint32_t* rb = j->sums + (size_t)((oy + 1) % j->W) * n3;
-    for (int i = 0; i < n3; i++) rb[i] += h[i] * wb;
+    for (int i = 0; i < n3; i++) { uint32_t v = h[i]; ra[i] += v * wa; rb[i] += v * wb; }
+  } else {
+    for (int i = 0; i < n3; i++) ra[i] += h[i] * wa;
   }
 }
 
@@ -1605,7 +1617,8 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
 
   jpeg_enc_config_t ec = {};
   ec.width = j->fw; ec.height = j->fh; ec.src_type = JPEG_PIXEL_FORMAT_RGB888; ec.subsampling = JPEG_SUBSAMPLE_420;
-  ec.quality = j->quality; ec.rotate = JPEG_ROTATE_0D; ec.task_enable = false; ec.hfm_task_priority = 13; ec.hfm_task_core = 1;
+  ec.quality = j->quality; ec.rotate = JPEG_ROTATE_0D;
+  ec.task_enable = true; ec.hfm_task_priority = 6; ec.hfm_task_core = 0;   // half the encoding on the other core
   jpeg_enc_handle_t enc = nullptr;
   if (jpeg_enc_open(&ec, &enc) != JPEG_ERR_OK || !enc) { blog("Fast encoder: couldn't start for %dx%d", j->fw, j->fh); free(blk); jpeg_dec_close(dec); return false; }
   int bs = jpeg_enc_get_block_size(enc);
@@ -1632,7 +1645,7 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
     int rows = io.out_size / (j->iw * 3);
     for (int k = 0; k < rows && y < j->ih; k++, y++) shrinkSourceRow(j, y, blk + (size_t)k * j->iw * 3);
     if (j->encFail) break;
-    vTaskDelay(1);                                      // let the web page and printer tasks run
+    if ((b & 3) == 3) vTaskDelay(1);                    // let the web page and printer tasks run now and then
   }
   bool ok = r == JPEG_ERR_OK && y == j->ih && !j->encFail;
   if (ok) shrinkFinalizeUntil(j, j->th);
@@ -1669,10 +1682,10 @@ static void shrinkFreeWork(ShrinkJob* j) {
 static bool shrinkPrepareResampler(ShrinkJob* j) {
   j->W = 3;                                             // output rows open at once (row-by-row processing)
   j->base = 0;
-  j->ox0   = (uint16_t*)bigAlloc((size_t)j->sw * 2);
-  j->wx0   = (uint16_t*)bigAlloc((size_t)j->sw * 2);
-  j->oy0   = (uint16_t*)bigAlloc((size_t)j->sh * 2);
-  j->wy0   = (uint16_t*)bigAlloc((size_t)j->sh * 2);
+  j->ox0   = (uint16_t*)fastAlloc((size_t)j->sw * 2);  // small tables: keep them in fast internal RAM
+  j->wx0   = (uint16_t*)fastAlloc((size_t)j->sw * 2);
+  j->oy0   = (uint16_t*)fastAlloc((size_t)j->sh * 2);
+  j->wy0   = (uint16_t*)fastAlloc((size_t)j->sh * 2);
   size_t sumBytes = (size_t)j->W * j->tw * 3 * sizeof(uint32_t);
   j->sums  = (uint32_t*)fastAlloc(sumBytes);
   j->hrow  = (uint32_t*)fastAlloc((size_t)j->tw * 3 * sizeof(uint32_t));
