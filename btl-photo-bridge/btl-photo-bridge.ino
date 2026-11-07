@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.8.4"
+#define FW_VERSION    "0.8.5"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -80,6 +80,13 @@ bool   dryRun    = false;    // test mode: process photos but don't print them
 volatile bool saveScaleFill = false;
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1872x1248, the printer's native size), 1 = Fast (two thirds of that)
+int    colWarm   = 0;        // -5 (cooler) .. +5 (warmer): the SELPHY's prints lean yellow, so cooler helps
+int    colCon    = 0;        // 0..3 contrast
+int    colSat    = 0;        // 0..3 color (saturation)
+static uint8_t colLut[3][256];          // per-channel curve: warmth + contrast
+static int     colSatK = 256;           // saturation factor, 256 = unchanged
+static volatile bool colOn = false;
+
 bool   useUsb    = true;     // print over USB when the printer is plugged in
 String ftpUser   = "btl";
 String ftpPass   = "print";
@@ -1544,6 +1551,39 @@ static void encOut(void* ctx, const uint8_t* d, size_t n) {
 
 // Encoder task: takes bands as the resampler finishes them, encodes each, and the bytes become
 // available to the sender right away.
+// Builds the color curves from the settings. Runs when settings change; cheap.
+static void buildColor() {
+  // Warmth bends the red and blue midtones (a gamma per channel) so white stays white and black stays black.
+  float gam[3] = { 1.0f - 0.025f * colWarm, 1.0f, 1.0f + 0.04f * colWarm };   // R, G, B; cooler = blue up, red down
+  float a = 0.15f * colCon;                                                  // S-curve strength (stays monotonic)
+  for (int c = 0; c < 3; c++)
+    for (int v = 0; v < 256; v++) {
+      float x = v / 255.0f;
+      x = x - a * sinf(6.2831853f * x) / 6.2831853f;                         // contrast
+      if (x > 0.0f) x = powf(x, gam[c]);                                     // warmth
+      int o = (int)lroundf(x * 255.0f);
+      colLut[c][v] = (uint8_t)(o < 0 ? 0 : o > 255 ? 255 : o);
+    }
+  colSatK = 256 + 26 * colSat;                                               // +10% per step
+  colOn = colWarm || colCon || colSat;
+}
+
+// Applies the color settings to packed pixels in place (R,G,B order, or B,G,R when bgr).
+static void colorAdjust(uint8_t* p, size_t pixels, bool bgr) {
+  if (!colOn) return;
+  const int ri = bgr ? 2 : 0, bi = bgr ? 0 : 2;
+  const int k = colSatK;
+  for (size_t i = 0; i < pixels; i++, p += 3) {
+    int r = colLut[0][p[ri]], g = colLut[1][p[1]], b = colLut[2][p[bi]];
+    if (k != 256) {
+      int y = (77 * r + 150 * g + 29 * b) >> 8;
+      r = y + (((r - y) * k) >> 8); g = y + (((g - y) * k) >> 8); b = y + (((b - y) * k) >> 8);
+      r = r < 0 ? 0 : r > 255 ? 255 : r; g = g < 0 ? 0 : g > 255 ? 255 : g; b = b < 0 ? 0 : b > 255 ? 255 : b;
+    }
+    p[ri] = r; p[1] = g; p[bi] = b;
+  }
+}
+
 static void shrinkEncTask(void* arg) {
   ShrinkJob* j = (ShrinkJob*)arg;
   BtlJpegEnc* enc = (BtlJpegEnc*)j->enc;
@@ -1552,6 +1592,7 @@ static void shrinkEncTask(void* arg) {
     if (!j->encFail) {
       uint32_t t = millis();
       int rows = j->th - b * j->bandRows; if (rows > j->bandRows) rows = j->bandRows;
+      colorAdjust(j->bands[b & 1], (size_t)rows * j->tw, false);
       enc->addRows(j->bands[b & 1], rows);
       if (b + 1 == j->bandsTotal) enc->end();
       j->tEnc += millis() - t;
@@ -1969,6 +2010,7 @@ static void shrinkRun(ShrinkJob* j) {
   uint32_t t1 = millis();
   if (j->d && !j->eof) { j->sockBytes += drain(*j->d); j->eof = true; }   // e.g. Canon's embedded preview
 
+  colorAdjust(j->frame, (size_t)j->fw * j->fh, true);
   bool ok = fmt2jpg_cb(j->frame, frameBytes, j->fw, j->fh, PIXFORMAT_RGB888, j->quality, shrinkJpgOut, j);
   free(j->frame); j->frame = nullptr;
   if (!ok || j->outFail || !j->outLen) {
@@ -2423,8 +2465,18 @@ static void handleRoot() {
   h += "> Borderless <span class=mut>(asks for the postcard paper with zero margins; off = the printer's own margins, about 3.7 mm top and bottom)</span></label>"
        "<label><input type=checkbox name=dry";
   if (dryRun) h += " checked";
-  h += "> <b>Test mode</b>: process photos but don't print them <span class=mut>(timing shows in the log, no paper used)</span></label>"
-       "<label>Quality sent to the printer <select name=q>";
+  h += "> <b>Test mode</b>: process photos but don't print them <span class=mut>(timing shows in the log, no paper used)</span></label>";
+  h += "<label>Warmth <select name=cwarm>";
+  for (int v = -5; v <= 5; v++)
+    h += "<option value=" + String(v) + (v == colWarm ? " selected>" : ">") +
+         (v == 0 ? String("Neutral (as shot)") : v < 0 ? "Cooler " + String(-v) : "Warmer " + String(v)) + "</option>";
+  h += "</select> <span class=mut>(prints look yellow? pick Cooler)</span></label>";
+  h += "<label>Contrast <select name=ccon>";
+  for (int v = 0; v <= 3; v++) h += "<option value=" + String(v) + (v == colCon ? " selected>" : ">") + (v ? "+" + String(v) : String("As shot")) + "</option>";
+  h += "</select></label><label>Color <select name=csat>";
+  for (int v = 0; v <= 3; v++) h += "<option value=" + String(v) + (v == colSat ? " selected>" : ">") + (v ? "+" + String(v) : String("As shot")) + "</option>";
+  h += "</select> <span class=mut>(flat skin tones: try Contrast +1 and Color +1)</span></label>";
+  h += "<label>Quality sent to the printer <select name=q>";
   const int qs[3] = { 75, 85, 95 };
   const char* qn[3] = { "Fast", "Balanced", "Best" };
   for (int i = 0; i < 3; i++) h += "<option value=" + String(qs[i]) + (qs[i] == jpegQ ? " selected>" : ">") + qn[i] + "</option>";
@@ -2594,6 +2646,11 @@ static void handleSettings() {
   useUsb = server.hasArg("usb");
   speedMode = server.arg("speed").toInt() == 1 ? 1 : 0;
   prefs.putBool("usb", useUsb); prefs.putInt("speed", speedMode);
+  colWarm = constrain(server.arg("cwarm").toInt(), -5, 5);
+  colCon  = constrain(server.arg("ccon").toInt(), 0, 3);
+  colSat  = constrain(server.arg("csat").toInt(), 0, 3);
+  prefs.putInt("cwarm", colWarm); prefs.putInt("ccon", colCon); prefs.putInt("csat", colSat);
+  buildColor();
   int q = server.arg("q").toInt();
   if (q >= 50 && q <= 100) jpegQ = q;
   prefs.putBool("shrink", shrinkOn); prefs.putInt("q", jpegQ);
@@ -2770,6 +2827,8 @@ void setup() {
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
   speedMode = prefs.getInt("speed", 0);
+  colWarm = prefs.getInt("cwarm", 0); colCon = prefs.getInt("ccon", 0); colSat = prefs.getInt("csat", 0);
+  buildColor();
   ftpUser = prefs.getString("fuser", "btl");
   ftpPass = prefs.getString("fpass", "print");
 
