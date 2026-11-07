@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.9   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.10   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.9"
+#define FW_VERSION    "0.6.10"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -77,6 +77,7 @@ bool   shrinkOn  = true;     // shrink photos to print size before sending
 bool   fillOn    = true;     // crop photos to the paper's 3:2 shape instead of leaving white strips
 bool   scaleFill = true;     // ask the printer to scale the photo to fill the paper (IPP print-scaling=fill)
 bool   dryRun    = false;    // test mode: process photos but don't print them
+volatile bool saveScaleFill = false;
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1800x1200, 300 dpi), 1 = Fast (1200x800, half-size decode)
 bool   useUsb    = true;     // print over USB when the printer is plugged in
@@ -147,6 +148,7 @@ struct ShrinkJob {
   bool encFail = false;
   uint32_t tRecv = 0, tDec = 0, tEnc = 0, tDecOnly = 0;
   bool encTwoCores = false;
+  bool ownSums = false;          // accumulators allocated for this job (else the shared ones reserved at boot)
 };
 class CamData;                 // camera data link, defined below (declared here for Arduino's auto-prototypes)
 std::deque<Job>     jobs;
@@ -905,8 +907,9 @@ static void usbStart() {
 #else
   uOutDone = xSemaphoreCreateBinary();
   uRx = xStreamBufferCreate(USB_RX_BYTES, 1);
-  xTaskCreatePinnedToCore(usbLibTask, "usblib", 4096, nullptr, 5, nullptr, 0);
-  xTaskCreatePinnedToCore(usbClientTask, "usbcli", 6144, nullptr, 5, nullptr, 0);
+  // Stacks in external RAM: these tasks never write to flash, and internal RAM is precious.
+  xTaskCreatePinnedToCoreWithCaps(usbLibTask, "usblib", 4096, nullptr, 5, nullptr, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  xTaskCreatePinnedToCoreWithCaps(usbClientTask, "usbcli", 6144, nullptr, 5, nullptr, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #endif
 }
 
@@ -986,7 +989,7 @@ static uint16_t sendBufferJob(const Job& j, bool withScaling = true) {
   uint16_t st = parseIpp(body, nullptr);
   if (st >= 0x0400 && st < 0x0500 && withScaling && scaleFill) {   // printer didn't like print-scaling: send it plain
     blog("Printer refused print-scaling=fill (%s); turning that option off", ippStatusName(st).c_str());
-    scaleFill = false; prefs.putBool("pscale", false);
+    scaleFill = false; saveScaleFill = true;            // saved from loop(): this task's stack lives in external RAM
     return sendBufferJob(j, false);
   }
   if (st < 0x0100) lastSubmitMs = millis();
@@ -1687,27 +1690,42 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
 }
 
 static void shrinkFreeWork(ShrinkJob* j) {
-  free(j->ox0); free(j->wx0); free(j->oy0); free(j->wy0); free(j->sums); free(j->hrow); free(j->band); free(j->pool);
+  free(j->ox0); free(j->wx0); free(j->oy0); free(j->wy0); free(j->band); free(j->pool);
+  if (j->ownSums) { free(j->sums); free(j->hrow); }
   j->ox0 = j->wx0 = j->oy0 = j->wy0 = nullptr; j->sums = j->hrow = nullptr; j->band = nullptr; j->pool = nullptr;
 }
 
 // Mapping tables and accumulators for the box resampler (needs sw, sh, tw, th and the crop set).
+// The accumulators are hit for every pixel and must sit in internal RAM, which is scarce and
+// fragmented once Wi-Fi and USB are busy. So they're reserved once at boot and reused for every photo.
+#define RES_W 2                                         // output rows open at once: a source row touches at most two
+static uint32_t* resSums = nullptr;                     // RES_W x PRINT_LONG x 3
+static uint32_t* resHrow = nullptr;                     // PRINT_LONG x 3
+static void reserveResampler() {
+  resSums = (uint32_t*)heap_caps_malloc((size_t)RES_W * PRINT_LONG * 3 * sizeof(uint32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  resHrow = (uint32_t*)heap_caps_malloc((size_t)PRINT_LONG * 3 * sizeof(uint32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!resSums || !resHrow) { free(resSums); free(resHrow); resSums = resHrow = nullptr; }
+}
+
 static bool shrinkPrepareResampler(ShrinkJob* j) {
-  j->W = 2;                                             // output rows open at once: a source row touches at most two
+  j->W = RES_W;
   j->base = 0;
   j->ox0   = (uint16_t*)fastAlloc((size_t)j->sw * 2);  // small tables: keep them in fast internal RAM
   j->wx0   = (uint16_t*)fastAlloc((size_t)j->sw * 2);
   j->oy0   = (uint16_t*)fastAlloc((size_t)j->sh * 2);
   j->wy0   = (uint16_t*)fastAlloc((size_t)j->sh * 2);
-  // The accumulators are hit for every pixel: they must be in internal RAM (external RAM is ~10x slower here).
   size_t sumBytes = (size_t)j->W * j->tw * 3 * sizeof(uint32_t), rowBytes = (size_t)j->tw * 3 * sizeof(uint32_t);
-  j->sums  = (uint32_t*)heap_caps_malloc(sumBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  j->hrow  = (uint32_t*)heap_caps_malloc(rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!j->sums || !j->hrow) {
-    blog("Resizer: only %u KB of internal RAM free (largest block %u KB), using slow external RAM for the accumulators",
-         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
-    if (!j->sums) j->sums = (uint32_t*)bigAlloc(sumBytes);
-    if (!j->hrow) j->hrow = (uint32_t*)bigAlloc(rowBytes);
+  j->ownSums = !(resSums && resHrow && j->tw <= PRINT_LONG);
+  if (!j->ownSums) { j->sums = resSums; j->hrow = resHrow; }
+  else {
+    j->sums = (uint32_t*)heap_caps_malloc(sumBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    j->hrow = (uint32_t*)heap_caps_malloc(rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!j->sums || !j->hrow) {
+      blog("Resizer: only %u KB of internal RAM free (largest block %u KB), using slow external RAM for the accumulators",
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+      if (!j->sums) j->sums = (uint32_t*)bigAlloc(sumBytes);
+      if (!j->hrow) j->hrow = (uint32_t*)bigAlloc(rowBytes);
+    }
   }
   if (!j->ox0 || !j->wx0 || !j->oy0 || !j->wy0 || !j->sums || !j->hrow) return false;
   memset(j->sums, 0, sumBytes);
@@ -1835,12 +1853,16 @@ static void shrinkTaskFn(void* arg) {
   vTaskDelete(nullptr);
 }
 
+static SemaphoreHandle_t shrinkMtx = nullptr;
 static void shrinkBlocking(ShrinkJob* j) {
+  if (!shrinkMtx) shrinkMtx = xSemaphoreCreateMutex();
+  xSemaphoreTake(shrinkMtx, portMAX_DELAY);              // one photo at a time (shared accumulators)
   j->waiter = xTaskGetCurrentTaskHandle();
   if (xTaskCreatePinnedToCore(shrinkTaskFn, "shrink", 32768, j, 1, nullptr, 1) != pdPASS) {
-    j->result = 0; j->why = "no memory to start the resizer"; return;
+    j->result = 0; j->why = "no memory to start the resizer"; xSemaphoreGive(shrinkMtx); return;
   }
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  xSemaphoreGive(shrinkMtx);
 }
 
 // Shrinks a complete JPEG held in memory. On success replaces data/len with the small version.
@@ -2505,6 +2527,7 @@ void setup() {
   ftpUser = prefs.getString("fuser", "btl");
   ftpPass = prefs.getString("fpass", "print");
 
+  if (psramFound()) reserveResampler();            // while internal RAM is still clean
   bootMark("settings loaded");
   improv.begin("BTL Photo Printer Bridge", FW_VERSION, "ESP32-S3", improvName, improvConnect);
   prevLog = esp_log_set_vprintf(logHook);
@@ -2523,8 +2546,8 @@ void setup() {
   if (wifiOk) improvShowAddress();
 
   if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
-  if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s, %u KB internal RAM free)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF",
-                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+  if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s, %u KB internal RAM free, resizer buffers %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF",
+                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), resSums ? "reserved" : "NOT reserved");
   else blog("Home Wi-Fi not connected - page at http://%s on the camera network  (PSRAM %s)", AP_IP.toString().c_str(), psramFound() ? "on" : "OFF");
   MDNS.begin(HOSTNAME);
   MDNS.addService("http", "tcp", 80);
@@ -2557,13 +2580,14 @@ void setup() {
   server.on("/apsettings", HTTP_POST, handleApSettings);
   server.begin();
 
-  xTaskCreatePinnedToCore(printTask, "print", 12288, nullptr, 1, nullptr, 1);
-  xTaskCreatePinnedToCore(ftpTask, "ftp", 16384, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCoreWithCaps(printTask, "print", 12288, nullptr, 1, nullptr, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  xTaskCreatePinnedToCoreWithCaps(ftpTask, "ftp", 16384, nullptr, 1, nullptr, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
 void loop() {
   serviceImprov();
   server.handleClient();
+  if (saveScaleFill) { saveScaleFill = false; prefs.putBool("pscale", scaleFill); }
   static bool wasUp = false;                      // home Wi-Fi can come and go; note it in the log
   bool up = WiFi.status() == WL_CONNECTED;
   if (up != wasUp) {
