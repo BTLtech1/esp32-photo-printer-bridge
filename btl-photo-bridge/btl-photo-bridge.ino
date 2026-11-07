@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.1   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.2   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.1"
+#define FW_VERSION    "0.6.2"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -65,7 +65,6 @@ const char* WIFI_PASS = "";
 
 WebServer   server(80);
 WiFiServer  ftpCtl(FTP_PORT);
-WiFiServer  ftpData(FTP_PASV_PORT);
 Preferences prefs;
 
 SemaphoreHandle_t printerMtx;   // one conversation with the printer at a time
@@ -105,7 +104,7 @@ struct ShrinkJob {
   // input
   const uint8_t* hb = nullptr;   // bytes already received (at least the full JPEG header)
   size_t hn = 0;
-  WiFiClient* d = nullptr;       // rest of the photo comes from here (nullptr = hb is the whole file)
+  Client* d = nullptr;           // rest of the photo comes from here (nullptr = hb is the whole file)
   bool eof = false;
   int orient = 1;
   uint8_t quality = 85;
@@ -120,13 +119,7 @@ struct ShrinkJob {
   bool err = false;
   int iw = 0, ih = 0, s = 0, sw = 0, sh = 0, tw = 0, th = 0, fw = 0, fh = 0, W = 0, base = 0;
   bool fill = true;              // fill the paper: crop the edges that don't fit 3:2 (otherwise fit inside, leaving white)
-  // Receive-ahead: a helper task pulls the camera's data into a big buffer while the decoder works,
-  // so the camera never waits for the decoder (the Wi-Fi stack's own buffer is only a few KB).
-  StreamBufferHandle_t rx = nullptr;
-  StaticStreamBuffer_t* rxCtl = nullptr;
-  uint8_t* rxMem = nullptr;
-  volatile bool rxDone = false, rxErr = false, rxStop = false, rxExited = false;
-  size_t rxBytes = 0;
+  size_t rxBytes = 0;            // bytes taken from the camera link
   uint32_t rxFirstMs = 0, rxLastMs = 0, waitMs = 0;
   int cx0 = 0, cy0 = 0, cw = 0, ch = 0;   // the part of the (scaled) source that goes onto the print
   float kScale = 1.0f;           // output size / source size
@@ -151,8 +144,9 @@ struct ShrinkJob {
   size_t bandBytes = 0;
   void* enc = nullptr;
   bool encFail = false;
-  uint32_t tRecv = 0, tDec = 0, tEnc = 0;
+  uint32_t tRecv = 0, tDec = 0, tEnc = 0, tDecOnly = 0;
 };
+class CamData;                 // camera data link, defined below (declared here for Arduino's auto-prototypes)
 std::deque<Job>     jobs;
 std::deque<String>  logLines;
 std::vector<String> printedNames;
@@ -999,7 +993,7 @@ static uint16_t sendBufferJob(const Job& j, bool withScaling = true) {
 
 // Streams a photo straight from the camera's data connection into a Print-Job.
 // 'pre' holds bytes already read from the camera.
-static uint16_t streamJob(WiFiClient& d, const uint8_t* pre, size_t preLen, bool eof, const String& name, size_t& total) {
+static uint16_t streamJob(Client& d, const uint8_t* pre, size_t preLen, bool eof, const String& name, size_t& total) {
   // Collect the camera's data into big blocks before forwarding: lots of tiny network
   // packets make the printer's connection crawl.
   const size_t BLK = 64 * 1024;
@@ -1011,7 +1005,6 @@ static uint16_t streamJob(WiFiClient& d, const uint8_t* pre, size_t preLen, bool
   Client* c = printerConnect(w, 5000);
   if (!c) return 0xFFFE;
   Client& pc = *c;
-  d.setNoDelay(true);
   uint32_t t0 = millis();
   sendPostHeaders(pc, true, 0);
   std::vector<uint8_t> h;
@@ -1232,10 +1225,147 @@ static int findMeta(const uint8_t* b, size_t n, int* orient) {
   return rating;
 }
 
+// =============================================================== camera data link
+// The camera's photo comes in over the FTP data connection. The Wi-Fi stack's normal sockets only
+// offer the camera a 5.7 KB receive window, and the camera's power saving makes every round trip slow,
+// so the transfer crawled at 80-200 KB/s. This connection uses the stack's raw TCP interface instead,
+// advertises a 32 KB window, acknowledges every segment at once, and parks the data in a 1 MB buffer
+// in PSRAM for the decoder to read at its own pace.
+#include "lwip/tcp.h"
+#include "lwip/tcpip.h"
+#include "lwip/priv/tcp_priv.h"
+
+#define CAM_WND   32768
+#define CAM_RING  (1024 * 1024)
+
+class CamData : public Client {
+ public:
+  void listen(uint16_t port) {
+    ringMem = (uint8_t*)heap_caps_malloc(CAM_RING, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ring = ringMem ? xStreamBufferCreateStatic(CAM_RING, 1, ringMem, &ringCtl) : nullptr;
+    if (!ring) { blog("Camera link: no memory for the receive buffer"); return; }
+    LOCK_TCPIP_CORE();
+    tcp_pcb* l = tcp_new();
+    if (l && tcp_bind(l, IP_ANY_TYPE, port) == ERR_OK) {
+      l = tcp_listen_with_backlog(l, 2);
+      tcp_arg(l, this);
+      tcp_accept(l, onAccept);
+      lst = l;
+    } else if (l) tcp_abort(l);
+    UNLOCK_TCPIP_CORE();
+    if (!lst) blog("Camera link: couldn't listen on port %u", port);
+  }
+
+  // Waits for the camera to connect to the data port.
+  bool open(uint32_t timeoutMs) {
+    uint32_t t = millis();
+    while (!accepted) { if (millis() - t > timeoutMs) return false; delay(2); }
+    return true;
+  }
+
+  int available() override { return ring ? (int)xStreamBufferBytesAvailable(ring) : 0; }
+  int read(uint8_t* buf, size_t len) override {
+    if (!ring) return 0;
+    int n = (int)xStreamBufferReceive(ring, buf, len, 0);
+    if (n > 0 && clamped) reopenWindow();
+    return n;
+  }
+  int read() override { uint8_t b; return read(&b, 1) == 1 ? b : -1; }
+  int peek() override { return -1; }
+  uint8_t connected() override { return (pcb != nullptr && !closed) || available() > 0; }
+  operator bool() override { return connected(); }
+  void flush() override {}
+  size_t write(uint8_t) override { return 0; }
+  size_t write(const uint8_t*, size_t) override { return 0; }
+  int connect(IPAddress, uint16_t) override { return 0; }
+  int connect(const char*, uint16_t) override { return 0; }
+
+  // Closes the data connection and empties the buffer.
+  void stop() override {
+    LOCK_TCPIP_CORE();
+    if (pcb) {
+      tcp_arg(pcb, nullptr); tcp_recv(pcb, nullptr); tcp_err(pcb, nullptr);
+      if (tcp_close(pcb) != ERR_OK) tcp_abort(pcb);
+      pcb = nullptr;
+    }
+    UNLOCK_TCPIP_CORE();
+    accepted = false; closed = false; clamped = false;
+    if (ring) xStreamBufferReset(ring);
+  }
+
+ private:
+  tcp_pcb* lst = nullptr;
+  tcp_pcb* volatile pcb = nullptr;
+  StreamBufferHandle_t ring = nullptr;
+  StaticStreamBuffer_t ringCtl;
+  uint8_t* ringMem = nullptr;
+  volatile bool accepted = false, closed = false, clamped = false;
+
+  size_t windowNow() { size_t f = ring ? xStreamBufferSpacesAvailable(ring) : 0; return f < CAM_WND ? f : CAM_WND; }
+
+  // Tell the camera how much it may send. Called with the stack locked (from its thread or ours).
+  void setWindow(tcp_pcb* p) {
+    size_t w = windowNow();
+    clamped = w < CAM_WND;
+    p->rcv_wnd = (tcpwnd_size_t)w;
+    p->rcv_ann_wnd = (tcpwnd_size_t)w;
+    p->rcv_ann_right_edge = p->rcv_nxt + p->rcv_ann_wnd;
+    tcp_set_flags(p, TF_ACK_NOW);
+  }
+
+  void reopenWindow() {                                   // the decoder freed space: let the camera continue
+    if (windowNow() < CAM_WND) return;
+    LOCK_TCPIP_CORE();
+    if (pcb && !closed) { setWindow(pcb); tcp_output(pcb); }
+    UNLOCK_TCPIP_CORE();
+  }
+
+  static err_t onAccept(void* arg, tcp_pcb* np, err_t err) {
+    CamData* self = (CamData*)arg;
+    if (err != ERR_OK || !np) return ERR_VAL;
+    if (self->pcb) { tcp_abort(np); return ERR_ABRT; }   // one connection at a time
+    if (self->ring) xStreamBufferReset(self->ring);
+    self->closed = false; self->clamped = false;
+    tcp_arg(np, self);
+    tcp_recv(np, onRecv);
+    tcp_err(np, onErr);
+    tcp_nagle_disable(np);
+    self->setWindow(np);
+    self->pcb = np;
+    self->accepted = true;
+    return ERR_OK;
+  }
+
+  static err_t onRecv(void* arg, tcp_pcb* p, pbuf* pb, err_t err) {
+    CamData* self = (CamData*)arg;
+    if (!pb) {                                            // the camera closed its side: the file is complete
+      self->closed = true;
+      tcp_arg(p, nullptr); tcp_recv(p, nullptr); tcp_err(p, nullptr);
+      self->pcb = nullptr;
+      if (tcp_close(p) != ERR_OK) tcp_abort(p);
+      return ERR_OK;
+    }
+    if (err != ERR_OK) { pbuf_free(pb); return ERR_OK; }
+    if (xStreamBufferSpacesAvailable(self->ring) < pb->tot_len) return ERR_MEM;   // keep it, lwIP offers it again
+    for (pbuf* q = pb; q; q = q->next) xStreamBufferSend(self->ring, q->payload, q->len, 0);
+    pbuf_free(pb);
+    self->setWindow(p);
+    return ERR_OK;
+  }
+
+  static void onErr(void* arg, err_t) {                   // connection reset or dropped; the pcb is gone already
+    CamData* self = (CamData*)arg;
+    if (!self) return;
+    self->pcb = nullptr;
+    self->closed = true;
+  }
+};
+CamData camData;
+
 // =============================================================== FTP server (for the camera)
 static void ftpSend(WiFiClient& c, const String& s) { c.print(s + "\r\n"); }
 
-static size_t drain(WiFiClient& d) {
+static size_t drain(Client& d) {
   static uint8_t tmp[4096];
   size_t t = 0;
   while (true) { int n = readSome(d, tmp, sizeof(tmp), 30000); if (n <= 0) break; t += n; }
@@ -1251,52 +1381,6 @@ static size_t drain(WiFiClient& d) {
 #define PRINT_SHORT 1200
 
 
-static void shrinkRxTask(void* arg) {
-  ShrinkJob* j = (ShrinkJob*)arg;
-  uint8_t* tmp = (uint8_t*)malloc(16384);
-  while (tmp && !j->rxStop) {
-    int n = readSome(*j->d, tmp, 16384, 30000);
-    if (n <= 0) { if (n < 0) j->rxErr = true; break; }
-    if (!j->rxFirstMs) j->rxFirstMs = millis();
-    size_t off = 0;
-    while (off < (size_t)n && !j->rxStop) off += xStreamBufferSend(j->rx, tmp + off, n - off, pdMS_TO_TICKS(100));
-    j->rxBytes += n; j->rxLastMs = millis();
-  }
-  free(tmp);
-  j->rxDone = true;
-  j->rxExited = true;
-  vTaskDelete(nullptr);
-}
-
-// Starts the receive-ahead helper (only for photos streaming in from the camera).
-static void shrinkRxStart(ShrinkJob* j) {
-  if (!j->d || j->eof) return;
-  size_t avail = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-  size_t cap = avail > 1536 * 1024 ? 1024 * 1024 : avail > 640 * 1024 ? avail - 512 * 1024 : 0;
-  if (cap < 64 * 1024) return;                            // not enough room: read straight from the socket
-  j->rxMem = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  j->rxCtl = (StaticStreamBuffer_t*)malloc(sizeof(StaticStreamBuffer_t));
-  if (!j->rxMem || !j->rxCtl) { free(j->rxMem); free(j->rxCtl); j->rxMem = nullptr; j->rxCtl = nullptr; return; }
-  j->rx = xStreamBufferCreateStatic(cap, 1, j->rxMem, j->rxCtl);
-  if (!j->rx || xTaskCreatePinnedToCore(shrinkRxTask, "shrinkrx", 4096, j, 2, nullptr, 0) != pdPASS) {
-    if (j->rx) vStreamBufferDelete(j->rx);
-    free(j->rxMem); free(j->rxCtl); j->rx = nullptr; j->rxMem = nullptr; j->rxCtl = nullptr;
-  }
-}
-
-// Waits for the helper to finish (stop = true: tell it to quit now) and frees the buffer.
-static void shrinkRxFinish(ShrinkJob* j, bool stop) {
-  if (!j->rx) return;
-  if (stop) j->rxStop = true;
-  uint8_t sink[512];
-  while (!j->rxExited) {                                  // keep emptying the buffer so the helper never gets stuck on a full one
-    if (xStreamBufferReceive(j->rx, sink, sizeof(sink), pdMS_TO_TICKS(2)) == 0) delay(1);
-  }
-  vStreamBufferDelete(j->rx);
-  free(j->rxMem); free(j->rxCtl);
-  j->rx = nullptr; j->rxMem = nullptr; j->rxCtl = nullptr;
-}
-
 static size_t shrinkIn(JDEC* jd, uint8_t* buf, size_t nd) {
   ShrinkJob* j = (ShrinkJob*)jd->device;
   size_t got = 0;
@@ -1311,19 +1395,9 @@ static size_t shrinkIn(JDEC* jd, uint8_t* buf, size_t nd) {
     if (j->eof || !j->d) break;
     uint8_t* dst = buf ? buf + got : tmp;
     size_t want = buf ? nd - got : min(nd - got, sizeof(tmp));
-    int n;
-    if (j->rx) {                                          // from the receive-ahead buffer
-      uint32_t w0 = millis();
-      while (true) {
-        n = xStreamBufferReceive(j->rx, dst, want, pdMS_TO_TICKS(20));
-        if (n > 0) break;
-        if (j->rxDone && xStreamBufferIsEmpty(j->rx)) { n = j->rxErr ? -1 : 0; break; }
-        if (millis() - w0 > 30000) { n = -1; break; }
-      }
-      j->waitMs += millis() - w0;
-    } else {
-      n = readSome(*j->d, dst, want, 30000);
-    }
+    uint32_t w0 = millis();
+    int n = readSome(*j->d, dst, want, 30000);
+    j->waitMs += millis() - w0;
     if (n <= 0) { if (n < 0) j->err = true; j->eof = true; break; }
     got += n; j->sockBytes += n;
   }
@@ -1527,7 +1601,9 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   int y = 0;
   jpeg_error_t r = JPEG_ERR_OK;
   for (int b = 0; b < count; b++) {
+    uint32_t td = millis();
     r = jpeg_dec_process(dec, &io);
+    j->tDecOnly += millis() - td;
     if (r != JPEG_ERR_OK) break;
     int rows = io.out_size / (j->iw * 3);
     for (int k = 0; k < rows && y < j->ih; k++, y++) shrinkSourceRow(j, y, blk + (size_t)k * j->iw * 3);
@@ -1551,9 +1627,10 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   size_t inBytes = j->hn;
   char b[200];
   bool cropped = j->cw < j->sw || j->ch < j->sh;
-  snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (camera %.1f s at %u KB/s, decode+resize %.1f s, encode %.1f s)",
+  snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (camera %.1f s at %u KB/s, decode %.1f s, resize %.1f s, encode %.1f s)",
            j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(), cropped ? " (edges trimmed to fill the paper)" : "",
-           (millis() - t0) / 1000.0, j->tRecv / 1000.0, j->tRecv ? (unsigned)(j->rxBytes / j->tRecv) : 0u, j->tDec / 1000.0, j->tEnc / 1000.0);
+           (millis() - t0) / 1000.0, j->tRecv / 1000.0, j->tRecv ? (unsigned)(j->rxBytes / j->tRecv) : 0u, j->tDecOnly / 1000.0,
+           (j->tDec - j->tDecOnly) / 1000.0, j->tEnc / 1000.0);
   j->info = b;
   j->result = 1;
   return true;
@@ -1639,11 +1716,9 @@ static void shrinkRun(ShrinkJob* j) {
     j->why = "not enough memory"; return;
   }
 
-  shrinkRxStart(j);
   JDEC jd;
   JRESULT rc = jd_prepare(&jd, shrinkIn, j->pool, POOL, j);
   if (rc != JDR_OK || jd.width != j->iw || jd.height != j->ih) {
-    shrinkRxFinish(j, true);
     shrinkFreeWork(j); free(j->frame); j->frame = nullptr;
     j->why = "decoder could not read it (" + String((int)rc) + ")";
     j->result = (j->sockBytes && !j->whole) ? -1 : 0;   // with the file in memory the original is still usable
@@ -1652,14 +1727,12 @@ static void shrinkRun(ShrinkJob* j) {
   int mcuRows = (jd.msy * 8) >> j->s;                     // block row height: 8 or 16 rows, scaled
   if (mcuRows < 1) mcuRows = 1;
   if (mcuRows > j->bandH) {                               // never: blocks are at most 16 rows tall
-    shrinkRxFinish(j, true);
     shrinkFreeWork(j); free(j->frame); j->frame = nullptr; shrinkFreeWhole(j);
     j->why = "unexpected block size"; j->result = -1; return;
   }
   j->bandH = mcuRows;
   rc = jd_decomp(&jd, shrinkOut, j->s);
   if (rc != JDR_OK) {
-    shrinkRxFinish(j, true);
     shrinkFreeWork(j); free(j->frame); j->frame = nullptr; shrinkFreeWhole(j);
     j->why = j->err ? String("camera stopped sending") : ("decode error " + String((int)rc));
     j->result = -1;
@@ -1669,10 +1742,7 @@ static void shrinkRun(ShrinkJob* j) {
   shrinkFinalizeUntil(j, j->th);
   shrinkFreeWork(j);
   uint32_t t1 = millis();
-  if (j->rx) {                                            // let the helper take in the rest (e.g. Canon's embedded preview)
-    shrinkRxFinish(j, false);
-    j->sockBytes = j->rxBytes; j->eof = true;
-  } else if (j->d && !j->eof) { j->sockBytes += drain(*j->d); j->eof = true; }
+  if (j->d && !j->eof) { j->sockBytes += drain(*j->d); j->eof = true; }   // e.g. Canon's embedded preview
 
   bool ok = fmt2jpg_cb(j->frame, frameBytes, j->fw, j->fh, PIXFORMAT_RGB888, j->quality, shrinkJpgOut, j);
   free(j->frame); j->frame = nullptr;
@@ -1729,19 +1799,11 @@ static bool shrinkBuffer(uint8_t*& data, size_t& len, String& info) {
   return true;
 }
 
-static void flushPendingData() {
-  while (true) { WiFiClient x = SRV_ACCEPT(ftpData); if (!x) break; x.stop(); }
-}
+static void flushPendingData() { camData.stop(); }
 
-static bool openData(WiFiClient& d, bool active, IPAddress ip, uint16_t port) {
-  if (active) return d.connect(ip, port, 5000);
-  uint32_t t = millis();
-  while (millis() - t < 10000) {
-    WiFiClient x = SRV_ACCEPT(ftpData);
-    if (x) { d = x; return true; }
-    delay(5);
-  }
-  return false;
+static bool openData(CamData& d, bool active, IPAddress ip, uint16_t port) {
+  if (active) return false;                             // only passive mode (the camera connects to us)
+  return d.open(10000);
 }
 
 static String finishStream(uint16_t st, const String& name, size_t total) {
@@ -1755,7 +1817,7 @@ static String finishStream(uint16_t st, const String& name, size_t total) {
 }
 
 // Receives one file from the camera and decides what to do with it. Returns the FTP reply.
-static String ftpStor(WiFiClient& d, const String& path) {
+static String ftpStor(Client& d, const String& path) {
   String name = path;
   int sl = name.lastIndexOf('/');
   if (sl >= 0) name = name.substring(sl + 1);
@@ -1949,13 +2011,13 @@ static void ftpSession(WiFiClient& c) {
       else ftpSend(c, "501 Bad EPRT");
     }
     else if (cmd == "LIST" || cmd == "NLST" || cmd == "MLSD") {
-      WiFiClient d;
-      if (!openData(d, active, aIP, aPort)) ftpSend(c, "425 No data connection");
+      CamData& d = camData;
+      if (!openData(d, active, aIP, aPort)) ftpSend(c, active ? "425 Use passive mode" : "425 No data connection");
       else { ftpSend(c, "150 Listing"); d.stop(); ftpSend(c, "226 Done"); }
     }
     else if (cmd == "STOR" || cmd == "APPE" || cmd == "STOU") {
-      WiFiClient d;
-      if (!openData(d, active, aIP, aPort)) { ftpSend(c, "425 No data connection"); continue; }
+      CamData& d = camData;
+      if (!openData(d, active, aIP, aPort)) { ftpSend(c, active ? "425 Use passive mode" : "425 No data connection"); continue; }
       blog("Camera timing (ms): %sdata@%lu", trace.c_str(), (unsigned long)(millis() - tStart));
       ftpSend(c, "150 Ready to receive");
       String r = ftpStor(d, arg.length() ? arg : String("photo.jpg"));
@@ -2391,7 +2453,7 @@ void setup() {
   MDNS.begin(HOSTNAME);
   MDNS.addService("http", "tcp", 80);
   ftpCtl.begin();
-  ftpData.begin();
+  camData.listen(FTP_PASV_PORT);
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
