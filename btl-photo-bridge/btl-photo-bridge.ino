@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.8.5"
+#define FW_VERSION    "0.8.6"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -78,6 +78,13 @@ bool   fillOn    = true;     // crop photos to the paper's 3:2 shape instead of 
 bool   scaleFill = true;     // borderless: ask for the paper with zero margins (media-col)
 bool   dryRun    = false;    // test mode: process photos but don't print them
 volatile bool saveScaleFill = false;
+int    cassCap   = 36;       // prints per ink cassette (set on the page; depends on the pack)
+volatile int cassUsed = 0;   // prints since the last "New cassette"
+volatile bool saveCass = false;
+// The SELPHY doesn't report how much ink is left, so the bridge counts its own prints.
+#define countPrint() do { if (!dryRun) { cassUsed++; saveCass = true; } } while (0)
+// if (!dryRun) { cassUsed++; saveCass = true; } }
+#define printsLeft() (cassCap - cassUsed < 0 ? 0 : cassCap - cassUsed)
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1872x1248, the printer's native size), 1 = Fast (two thirds of that)
 int    colWarm   = 0;        // -5 (cooler) .. +5 (warmer): the SELPHY's prints lean yellow, so cooler helps
@@ -1158,6 +1165,7 @@ static void printTask(void*) {
           bool done = true;
           if (st < 0x0100) {
             blog("Printing %s (%s) - sent over %s in %.1f s, printer took %.1f s to accept", j.name.c_str(), fmtSize(j.len).c_str(), curUsb ? "USB" : "Wi-Fi", lastSendMs / 1000.0, lastAnswerMs / 1000.0);
+            countPrint();
             if (printMode == 1) addPrinted(j.name);
           } else if (retryable(st) && j.tries < 5) {
             done = false;
@@ -2105,6 +2113,7 @@ static bool openData(CamData& d, bool active, IPAddress ip, uint16_t port) {
 static String finishStream(uint16_t st, const String& name, size_t total) {
   if (st < 0x0100) {
     blog("Printing %s (%s) - sent over %s in %.1f s, printer took %.1f s to accept", name.c_str(), fmtSize(total).c_str(), curUsb ? "USB" : "Wi-Fi", lastSendMs / 1000.0, lastAnswerMs / 1000.0);
+    countPrint();
     if (printMode == 1) addPrinted(name);
     return "226 Transfer complete - printing";
   }
@@ -2206,6 +2215,7 @@ static String ftpStor(Client& d, const String& path) {
         free(sj.out);
         if (st < 0x0100) {
           blog("Printed live: %s (%s) - %s; printer took %.1f s to accept", name.c_str(), stars(rating).c_str(), sj.info.c_str(), lastAnswerMs / 1000.0);
+          countPrint();
           if (printMode == 1) addPrinted(name);
           return "226 Transfer complete - printing";
         }
@@ -2434,6 +2444,10 @@ static void handleRoot() {
        "<tr><td>USB port</td><td id=pu>&hellip;</td></tr>"
        "<tr><td>State</td><td id=ps>&hellip;</td></tr>"
        "<tr><td>Waiting to print</td><td id=pq>0</td></tr>"
+       "<tr><td>Ink cassette</td><td><span id=pl>&hellip;</span>"
+       "<form method=post action=/cassette style='display:inline;margin-left:8px'>"
+       "of <input name=cap type=number min=1 max=200 style='width:4.5em' value=" + String(cassCap) + "> "
+       "<button name=new value=1 style='padding:4px 10px'>New cassette</button> <button style='padding:4px 10px'>Save size</button></form></td></tr>"
        "<tr><td>Mode</td><td>";
   if (printMode == 1) h += "Only photos rated " + String(minRating) + "&#9733; or more";
   else h += "Every photo the camera sends";
@@ -2532,7 +2546,7 @@ static void handleRoot() {
 
   h += "<script>async function u(){try{const s=await(await fetch('/status')).json();"
        "pr.textContent=s.printer;ps.textContent=s.pstate+(s.reasons&&s.reasons!='none'?' ('+s.reasons+')':'');"
-       "pu.textContent=s.usb;pq.textContent=s.queue;log.textContent=s.log.join('\\n')||'Nothing yet.';}catch(e){}}"
+       "pu.textContent=s.usb;pq.textContent=s.queue;pl.textContent=s.left+' prints left';pl.style.color=s.left<=5?'#f5b400':'';log.textContent=s.log.join('\\n')||'Nothing yet.';}catch(e){}}"
        "u();setInterval(u,3000);</script></body></html>";
   server.send(200, "text/html", h);
 }
@@ -2626,11 +2640,19 @@ static void handleStatus() {
   String us = usbState;
   if (uReady && !useUsb) us += " (turned off in settings, using Wi-Fi)";
   j += "\"printer\":\"" + jsonEsc(pn) + "\",\"usb\":\"" + jsonEsc(us) + "\",\"pstate\":\"" + pst + "\",\"reasons\":\"" + jsonEsc(printerReasons) +
-       "\",\"queue\":" + String(jobs.size()) + ",\"log\":[";
+       "\",\"queue\":" + String(jobs.size()) + ",\"left\":" + String(printsLeft()) + ",\"cap\":" + String(cassCap) + ",\"log\":[";
   for (size_t i = 0; i < logLines.size(); i++) { if (i) j += ","; j += "\"" + jsonEsc(logLines[i]) + "\""; }
   xSemaphoreGive(dataMtx);
   j += "]}";
   server.send(200, "application/json", j);
+}
+
+static void handleCassette() {
+  int c = server.arg("cap").toInt();
+  if (c >= 1 && c <= 200) { cassCap = c; prefs.putInt("ccap", cassCap); }
+  if (server.hasArg("new")) { cassUsed = 0; prefs.putInt("cused", 0); blog("New ink cassette: %d prints", cassCap); }
+  else blog("Ink cassette size set to %d prints (%d left)", cassCap, printsLeft());
+  redirectHome();
 }
 
 static void handleSettings() {
@@ -2827,6 +2849,7 @@ void setup() {
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
   speedMode = prefs.getInt("speed", 0);
+  cassCap = prefs.getInt("ccap", 36); cassUsed = prefs.getInt("cused", 0);
   colWarm = prefs.getInt("cwarm", 0); colCon = prefs.getInt("ccon", 0); colSat = prefs.getInt("csat", 0);
   buildColor();
   ftpUser = prefs.getString("fuser", "btl");
@@ -2863,6 +2886,7 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/settings", HTTP_POST, handleSettings);
+  server.on("/cassette", HTTP_POST, handleCassette);
   server.on("/rediscover", HTTP_POST, []() { printerFound = false; redirectHome(); });
   server.on("/usbcheck", HTTP_POST, handleUsbCheck);
   server.on("/usbdiag", HTTP_GET, []() { server.send(200, "text/plain", usbDiagText()); });
@@ -2895,6 +2919,9 @@ void loop() {
   serviceImprov();
   server.handleClient();
   if (saveScaleFill) { saveScaleFill = false; prefs.putBool("pscale", scaleFill); }
+  if (saveCass) { saveCass = false; prefs.putInt("cused", cassUsed);
+    if (printsLeft() == 5) blog("Ink cassette: 5 prints left - have a new pack ready");
+    if (printsLeft() == 0) blog("Ink cassette: count says it's used up - put in a new pack and press New cassette"); }
   static bool wasUp = false;                      // home Wi-Fi can come and go; note it in the log
   bool up = WiFi.status() == WL_CONNECTED;
   if (up != wasUp) {
