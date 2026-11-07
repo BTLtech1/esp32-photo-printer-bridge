@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.4   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.5   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.4"
+#define FW_VERSION    "0.6.5"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -1537,9 +1537,10 @@ static size_t shrinkJpgOut(void* arg, size_t index, const void* data, size_t len
 // passed on to the streaming path with whatever was received so far.
 static bool shrinkReceiveWhole(ShrinkJob* j) {
   if (!j->d || j->eof) return true;                     // already complete in memory
+  const size_t KEEP = 2560 * 1024;                      // leave room for the decoder, encoder and queue
   size_t room = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-  if (room < 2 * 1024 * 1024) return false;
-  size_t cap = min(room - 1536 * 1024, (size_t)(5 * 1024 * 1024));
+  if (room < KEEP + 512 * 1024) return false;
+  size_t cap = min(max(j->hn * 2, (size_t)(1536 * 1024)), room - KEEP);   // grows if the file is bigger
   uint8_t* buf = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!buf) return false;
   memcpy(buf, j->hb, j->hn);
@@ -1547,7 +1548,13 @@ static bool shrinkReceiveWhole(ShrinkJob* j) {
   bool full = false;
   uint32_t t0 = millis();
   while (true) {
-    if (n >= cap) { full = true; break; }
+    if (n >= cap) {                                     // bigger than expected: grow while there's room
+      size_t more = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+      size_t nc = cap + min((size_t)(1024 * 1024), more > KEEP + cap ? more - KEEP - cap : (size_t)0);
+      uint8_t* nb = nc > cap ? (uint8_t*)heap_caps_realloc(buf, nc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : nullptr;
+      if (!nb) { full = true; break; }
+      buf = nb; cap = nc;
+    }
     int got = readSome(*j->d, buf + n, cap - n, 30000);
     if (got < 0) { j->err = true; j->eof = true; break; }
     if (got == 0) { j->eof = true; break; }
@@ -1581,7 +1588,7 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   jpeg_dec_config_t dc = {};
   dc.output_type = JPEG_PIXEL_FORMAT_RGB888; dc.rotate = JPEG_ROTATE_0D; dc.block_enable = true;
   jpeg_dec_handle_t dec = nullptr;
-  if (jpeg_dec_open(&dc, &dec) != JPEG_ERR_OK || !dec) return false;
+  if (jpeg_dec_open(&dc, &dec) != JPEG_ERR_OK || !dec) { blog("Fast decoder: couldn't start"); return false; }
   jpeg_dec_io_t io = {};
   io.inbuf = (uint8_t*)j->hb; io.inbuf_len = (int)j->hn; io.inbuf_remain = (int)j->hn;
   jpeg_dec_header_info_t hi = {};
@@ -1589,25 +1596,27 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   if (jpeg_dec_parse_header(dec, &io, &hi) != JPEG_ERR_OK || hi.width != j->iw || hi.height != j->ih ||
       jpeg_dec_get_outbuf_len(dec, &blkLen) != JPEG_ERR_OK || blkLen < j->iw * 3 ||
       jpeg_dec_get_process_count(dec, &count) != JPEG_ERR_OK || count < 1) {
+    blog("Fast decoder: can't read this file (reports %ux%u, expected %dx%d)", hi.width, hi.height, j->iw, j->ih);
     jpeg_dec_close(dec); return false;
   }
   uint8_t* blk = (uint8_t*)heap_caps_aligned_alloc(16, blkLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!blk) { jpeg_dec_close(dec); return false; }
+  if (!blk) { blog("Fast decoder: no memory for a block (%d bytes)", blkLen); jpeg_dec_close(dec); return false; }
   io.outbuf = blk;
 
   jpeg_enc_config_t ec = {};
   ec.width = j->fw; ec.height = j->fh; ec.src_type = JPEG_PIXEL_FORMAT_RGB888; ec.subsampling = JPEG_SUBSAMPLE_420;
   ec.quality = j->quality; ec.rotate = JPEG_ROTATE_0D; ec.task_enable = false; ec.hfm_task_priority = 13; ec.hfm_task_core = 1;
   jpeg_enc_handle_t enc = nullptr;
-  if (jpeg_enc_open(&ec, &enc) != JPEG_ERR_OK || !enc) { free(blk); jpeg_dec_close(dec); return false; }
+  if (jpeg_enc_open(&ec, &enc) != JPEG_ERR_OK || !enc) { blog("Fast encoder: couldn't start for %dx%d", j->fw, j->fh); free(blk); jpeg_dec_close(dec); return false; }
   int bs = jpeg_enc_get_block_size(enc);
-  if (bs <= 0 || bs % (j->fw * 3)) { jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false; }
+  if (bs <= 0 || bs % (j->fw * 3)) { blog("Fast encoder: unexpected block size %d", bs); jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false; }
   j->bandRows = bs / (j->fw * 3); j->bandBytes = bs;
   j->bandOut = (uint8_t*)heap_caps_aligned_alloc(16, bs, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  j->outCap = 1536 * 1024;
+  j->outCap = 768 * 1024;
   j->out = (uint8_t*)bigAlloc(j->outCap);
   j->enc = enc;
   if (!j->bandOut || !j->out || !shrinkPrepareResampler(j)) {
+    blog("Fast resizer: not enough memory (largest free PSRAM block %u KB)", (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
     shrinkFreeWork(j); free(j->bandOut); j->bandOut = nullptr; free(j->out); j->out = nullptr; j->outCap = 0; j->enc = nullptr;
     jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false;
   }
