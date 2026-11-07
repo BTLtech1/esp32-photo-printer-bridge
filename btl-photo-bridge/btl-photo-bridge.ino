@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.7.0   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.7.1   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.7.0"
+#define FW_VERSION    "0.7.1"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -158,8 +158,9 @@ struct ShrinkJob {
   TaskHandle_t encTaskH = nullptr;
   void (*sink)(void* ctx, const uint8_t* data, size_t len) = nullptr;   // where encoded bytes go as they're made
   void* sinkCtx = nullptr;
-  size_t sinkSent = 0;           // bytes of 'out' already handed to the sink
-  bool sinkFail = false;
+  volatile size_t sinkSent = 0;  // bytes of 'out' already handed to the sink
+  volatile bool sinkFail = false, sendExited = false;
+  SemaphoreHandle_t outReady = nullptr;   // the encoder signals the sender when more bytes exist
 };
 class CamData;                 // camera data link, defined below (declared here for Arduino's auto-prototypes)
 std::deque<Job>     jobs;
@@ -1492,14 +1493,29 @@ static void shrinkEncTask(void* arg) {
       int r = (int)jpeg_enc_process_with_block((jpeg_enc_handle_t)j->enc, j->bands[b & 1], (int)j->bandBytes, j->out, (int)j->outCap, &outLen);
       if (r < 0) j->encFail = true; else j->outLen = (size_t)outLen;
       j->tEnc += millis() - t;
-      if (!j->encFail && j->sink && !j->sinkFail && j->outLen > j->sinkSent) {
-        j->sink(j->sinkCtx, j->out + j->sinkSent, j->outLen - j->sinkSent);
-        j->sinkSent = j->outLen;
-      }
+      if (j->outReady) xSemaphoreGive(j->outReady);
     }
     xSemaphoreGive(j->bandFree[b & 1]);
   }
   j->encExited = true;
+  if (j->outReady) xSemaphoreGive(j->outReady);
+  vTaskDelete(nullptr);
+}
+
+// Sender task: feeds the printer from the output buffer at the printer's own pace, so neither the
+// resampler nor the encoder ever waits for it.
+static void shrinkSendTask(void* arg) {
+  ShrinkJob* j = (ShrinkJob*)arg;
+  while (true) {
+    xSemaphoreTake(j->outReady, pdMS_TO_TICKS(50));
+    size_t have = j->outLen;
+    if (have > j->sinkSent && !j->sinkFail && !j->encFail) {
+      j->sink(j->sinkCtx, j->out + j->sinkSent, have - j->sinkSent);
+      j->sinkSent = have;
+    }
+    if (j->encExited && (j->sinkSent >= j->outLen || j->sinkFail || j->encFail)) break;
+  }
+  j->sendExited = true;
   vTaskDelete(nullptr);
 }
 
@@ -1687,15 +1703,26 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   j->outCap = 768 * 1024;
   j->out = (uint8_t*)bigAlloc(j->outCap);
   j->enc = enc;
-  bool encStarted = false;
+  bool encStarted = false, sendStarted = false;
+  j->sendExited = true;
   if (j->bands[0] && j->bands[1] && j->bandFull[0] && j->bandFull[1] && j->bandFree[0] && j->bandFree[1] && j->out) {
+    if (j->sink) {                                        // sender first, so it's there when the first band is encoded
+      j->outReady = xSemaphoreCreateBinary();
+      j->sendExited = false;
+      sendStarted = j->outReady && xTaskCreatePinnedToCoreWithCaps(shrinkSendTask, "send", 6144, j, 1, nullptr, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+      if (!sendStarted) { j->sendExited = true; }
+    }
     // encoder on the other core; a stack in internal RAM if there's room, else external
-    encStarted = xTaskCreatePinnedToCore(shrinkEncTask, "encode", 10240, j, 2, &j->encTaskH, 0) == pdPASS;
-    if (!encStarted) encStarted = xTaskCreatePinnedToCoreWithCaps(shrinkEncTask, "encode", 10240, j, 2, &j->encTaskH, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+    if (!j->sink || sendStarted) {
+      encStarted = xTaskCreatePinnedToCore(shrinkEncTask, "encode", 10240, j, 2, &j->encTaskH, 0) == pdPASS;
+      if (!encStarted) encStarted = xTaskCreatePinnedToCoreWithCaps(shrinkEncTask, "encode", 10240, j, 2, &j->encTaskH, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+    }
   }
   if (!encStarted) {
     blog("Fast resizer: not enough memory (largest free PSRAM block %u KB, internal %u KB)", (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
          (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    if (sendStarted) { j->encExited = true; j->encFail = true; xSemaphoreGive(j->outReady); while (!j->sendExited) delay(1); }
+    if (j->outReady) { vSemaphoreDelete(j->outReady); j->outReady = nullptr; }
     shrinkFreeWork(j); shrinkFreeBands(j); free(j->out); j->out = nullptr; j->outCap = 0; j->enc = nullptr; j->bandOut = nullptr;
     jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false;
   }
@@ -1720,8 +1747,10 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   // let the encoder finish (or, after a failure, give it the bands it's still waiting for so it exits)
   while (j->bandCount < j->bandsTotal) { j->encFail = true; xSemaphoreGive(j->bandFull[(j->bandCount++) & 1]); }
   while (!j->encExited) delay(1);
+  while (!j->sendExited) delay(1);                      // the sender finishes handing the last bytes to the printer
+  if (j->outReady) { vSemaphoreDelete(j->outReady); j->outReady = nullptr; }
   ok = ok && !j->encFail && !j->sinkFail && j->outLen > 0;
-  j->tDec = tResDone - t1;                              // decode+resize wall time (encoding ran alongside)
+  j->tDec = tResDone - t1;                              // decode+resize wall time (encoding and sending ran alongside)
   jpeg_enc_close(enc); j->enc = nullptr;
   jpeg_dec_close(dec);
   free(blk);
