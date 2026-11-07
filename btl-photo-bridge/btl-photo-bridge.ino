@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.7.4   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.8.0   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -39,8 +39,8 @@
 #include <deque>
 #include "img_converters.h"   // JPEG encoder from the ESP32 core
 #include "btl_tjpgd.h"        // JPEG decoder (TJpgDec): fallback
-#include "esp_jpeg_dec.h"     // Espressif's fast JPEG codec (libraries/esp_new_jpeg): the normal path
-#include "esp_jpeg_enc.h"
+#include "esp_jpeg_dec.h"     // Espressif's fast JPEG decoder (libraries/esp_new_jpeg): the normal path
+#include "btl_jpeg_enc.h"     // our streaming JPEG encoder: bytes go out while the photo is still being made
 #include "usb/usb_host.h"     // USB host (printer on the board's USB port)
 #include "freertos/stream_buffer.h"
 #include "soc/soc.h"
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.7.4"
+#define FW_VERSION    "0.8.0"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -1497,17 +1497,32 @@ static void shrinkFinalizeRow(ShrinkJob* j, int oy) {
   }
 }
 
-// Encoder task: takes bands as the resampler finishes them, encodes each, passes new bytes to the sink.
+// The encoder's output lands in the job's output buffer; the sender streams it from there.
+static void encOut(void* ctx, const uint8_t* d, size_t n) {
+  ShrinkJob* j = (ShrinkJob*)ctx;
+  if (j->encFail) return;
+  if (j->outLen + n > j->outCap) {
+    size_t nc = j->outCap * 2; while (nc < j->outLen + n) nc *= 2;
+    uint8_t* nb = (uint8_t*)bigRealloc(j->out, nc);
+    if (!nb) { j->encFail = true; return; }
+    j->out = nb; j->outCap = nc;
+  }
+  memcpy(j->out + j->outLen, d, n);
+  j->outLen += n;
+}
+
+// Encoder task: takes bands as the resampler finishes them, encodes each, and the bytes become
+// available to the sender right away.
 static void shrinkEncTask(void* arg) {
   ShrinkJob* j = (ShrinkJob*)arg;
+  BtlJpegEnc* enc = (BtlJpegEnc*)j->enc;
   for (int b = 0; b < j->bandsTotal; b++) {
     xSemaphoreTake(j->bandFull[b & 1], portMAX_DELAY);
     if (!j->encFail) {
       uint32_t t = millis();
-      int outLen = 0;
-      // returns the block size while there's more to come, JPEG_ERR_OK (0) after the last block, negative on error
-      int r = (int)jpeg_enc_process_with_block((jpeg_enc_handle_t)j->enc, j->bands[b & 1], (int)j->bandBytes, j->out, (int)j->outCap, &outLen);
-      if (r < 0) j->encFail = true; else j->outLen = (size_t)outLen;
+      int rows = j->th - b * j->bandRows; if (rows > j->bandRows) rows = j->bandRows;
+      enc->addRows(j->bands[b & 1], rows);
+      if (b + 1 == j->bandsTotal) enc->end();
       j->tEnc += millis() - t;
       if (j->outReady) xSemaphoreGive(j->outReady);
     }
@@ -1527,7 +1542,7 @@ static void shrinkSendTask(void* arg) {
     xSemaphoreTake(j->outReady, pdMS_TO_TICKS(50));
     size_t have = j->outLen;
     bool last = j->encExited;
-    if (have > j->sinkSent && !j->sinkFail && !j->encFail && (last || have - j->sinkSent >= 16 * 1024)) {
+    if (have > j->sinkSent && !j->sinkFail && !j->encFail && (last || have - j->sinkSent >= 8 * 1024)) {
       if (!j->tFirstSend) j->tFirstSend = millis();
       j->sink(j->sinkCtx, j->out + j->sinkSent, have - j->sinkSent);
       j->sinkSent = have; j->sendWrites++;
@@ -1700,17 +1715,15 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   if (!blk) { blog("Fast decoder: no memory for a block (%d bytes)", blkLen); jpeg_dec_close(dec); shrinkFreeWork(j); return false; }
   io.outbuf = blk;
 
-  jpeg_enc_config_t ec = {};
-  ec.width = j->fw; ec.height = j->fh; ec.src_type = JPEG_PIXEL_FORMAT_RGB888; ec.subsampling = JPEG_SUBSAMPLE_420;
-  ec.quality = j->quality; ec.rotate = JPEG_ROTATE_0D;
-  ec.task_enable = false; ec.hfm_task_priority = 6; ec.hfm_task_core = 0;   // our own encoder task does the overlap
-  jpeg_enc_handle_t enc = nullptr;
-  if (jpeg_enc_open(&ec, &enc) != JPEG_ERR_OK || !enc) {
-    blog("Fast encoder: couldn't start for %dx%d", j->fw, j->fh); free(blk); jpeg_dec_close(dec); shrinkFreeWork(j); return false;
+  BtlJpegEnc* enc = new BtlJpegEnc();
+  j->outCap = 512 * 1024;
+  j->out = (uint8_t*)bigAlloc(j->outCap);
+  if (!enc || !j->out || !enc->begin(j->fw, j->fh, j->quality, encOut, j)) {
+    blog("Encoder: couldn't start for %dx%d", j->fw, j->fh);
+    delete enc; free(j->out); j->out = nullptr; j->outCap = 0; free(blk); jpeg_dec_close(dec); shrinkFreeWork(j); return false;
   }
-  int bs = jpeg_enc_get_block_size(enc);
-  if (bs <= 0 || bs % (j->fw * 3)) { blog("Fast encoder: unexpected block size %d", bs); jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); shrinkFreeWork(j); return false; }
-  j->bandRows = bs / (j->fw * 3); j->bandBytes = bs;
+  j->bandRows = 16; j->bandBytes = (size_t)j->fw * 16 * 3;
+  int bs = (int)j->bandBytes;
   j->bandsTotal = (j->th + j->bandRows - 1) / j->bandRows;
   j->bandCount = 0; j->encFail = false; j->encExited = false; j->sinkSent = 0; j->sinkFail = false;
   for (int i = 0; i < 2; i++) {
@@ -1720,8 +1733,6 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   }
   j->bandOut = j->bands[0];
   if (j->bandFree[1]) xSemaphoreGive(j->bandFree[1]);  // band 0 is in use from the start; band 1 is free
-  j->outCap = 768 * 1024;
-  j->out = (uint8_t*)bigAlloc(j->outCap);
   j->enc = enc;
   bool encStarted = false, sendStarted = false;
   j->sendExited = true;
@@ -1744,7 +1755,7 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
     if (sendStarted) { j->encExited = true; j->encFail = true; xSemaphoreGive(j->outReady); while (!j->sendExited) delay(1); }
     if (j->outReady) { vSemaphoreDelete(j->outReady); j->outReady = nullptr; }
     shrinkFreeWork(j); shrinkFreeBands(j); free(j->out); j->out = nullptr; j->outCap = 0; j->enc = nullptr; j->bandOut = nullptr;
-    jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false;
+    delete enc; free(blk); jpeg_dec_close(dec); return false;
   }
   j->encTwoCores = true;
 
@@ -1771,7 +1782,7 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   if (j->outReady) { vSemaphoreDelete(j->outReady); j->outReady = nullptr; }
   ok = ok && !j->encFail && !j->sinkFail && j->outLen > 0;
   j->tDec = tResDone - t1;                              // decode+resize wall time (encoding and sending ran alongside)
-  jpeg_enc_close(enc); j->enc = nullptr;
+  delete enc; j->enc = nullptr;
   jpeg_dec_close(dec);
   free(blk);
   shrinkFreeWork(j);
