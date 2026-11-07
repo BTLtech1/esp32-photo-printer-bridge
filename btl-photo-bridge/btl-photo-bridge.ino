@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.8.1   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.8.2   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.8.1"
+#define FW_VERSION    "0.8.2"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -2486,8 +2486,11 @@ static void handleUsbCheck() {
   redirectHome();
 }
 
-// Asks the printer what it can do (paper, scaling, resolution) and shows the answer as text.
-static void handlePrinterInfo() {
+// Asks the printer what it can do (paper, scaling, resolution) and shows the answer as text,
+// or (raw = true) hands over the printer's reply bytes as a file for inspection elsewhere.
+static void handlePrinterInfoRaw(bool raw);
+static void handlePrinterInfo() { handlePrinterInfoRaw(false); }
+static void handlePrinterInfoRaw(bool raw) {
   if (!printerAvailable()) { server.send(200, "text/plain", "No printer yet."); return; }
   if (xSemaphoreTake(printerMtx, pdMS_TO_TICKS(8000)) != pdTRUE) { server.send(200, "text/plain", "Printer busy, try again in a few seconds."); return; }
   WiFiClient w;
@@ -2513,9 +2516,16 @@ static void handlePrinterInfo() {
     std::vector<uint8_t> body;
     int code = readHttpResponse(*c, body);
     c->stop();
+    if (raw) {
+      xSemaphoreGive(printerMtx);
+      server.sendHeader("Content-Disposition", "attachment; filename=\"printer-attributes.bin\"");
+      server.send_P(200, "application/octet-stream", (const char*)body.data(), body.size());
+      return;
+    }
     String txt;
     uint16_t st = code == 200 ? parseIpp(body, &txt) : 0xFFFF;
     o += "HTTP " + String(code) + ", IPP " + ippStatusName(st) + ", " + String(millis() - t0) + " ms, " + String(body.size()) + " bytes\n" + txt + "\n";
+    o += "\nRaw reply as a file: /printerraw\n";
   }
   xSemaphoreGive(printerMtx);
   server.send(200, "text/plain", o);
@@ -2762,6 +2772,7 @@ void setup() {
   server.on("/usbcheck", HTTP_POST, handleUsbCheck);
   server.on("/usbdiag", HTTP_GET, []() { server.send(200, "text/plain", usbDiagText()); });
   server.on("/printerinfo", HTTP_GET, handlePrinterInfo);
+  server.on("/printerraw", HTTP_GET, []() { handlePrinterInfoRaw(true); });
   server.on("/usbreset", HTTP_POST, []() {
     if (usbHostStarted) {
       blog("USB: switching the port off and on");
