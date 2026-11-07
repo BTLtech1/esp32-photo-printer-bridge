@@ -1,10 +1,10 @@
 /*
-  BTL Photo Printer Bridge  v0.8.0   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.8.1   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
   - Print modes (on the bridge's page): every JPEG received, or only photos rated N stars or more.
-  - Each photo is shrunk to the printer's real resolution (about 1800x1200, 300 dpi on 4x6) and
+  - Each photo is shrunk to the printer's native print size (1872x1248 dots for a 4x6 with bleed) and
     turned upright before printing. Printers like the SELPHY take data in slowly, so smaller files print much sooner.
   - Photos wait in a queue (PSRAM) while the printer is busy.
   - Printer connection: USB cable when the printer is plugged into the board's "USB" port
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.8.0"
+#define FW_VERSION    "0.8.1"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -79,7 +79,7 @@ bool   scaleFill = true;     // ask the printer to scale the photo to fill the p
 bool   dryRun    = false;    // test mode: process photos but don't print them
 volatile bool saveScaleFill = false;
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
-int    speedMode = 0;        // 0 = Best (1800x1200, 300 dpi), 1 = Fast (1200x800, half-size decode)
+int    speedMode = 0;        // 0 = Best (1872x1248, the printer's native size), 1 = Fast (two thirds of that)
 bool   useUsb    = true;     // print over USB when the printer is plugged in
 String ftpUser   = "btl";
 String ftpPass   = "print";
@@ -110,7 +110,7 @@ struct ShrinkJob {
   bool eof = false;
   int orient = 1;
   uint8_t quality = 85;
-  bool fast = false;             // Fast mode: 1200x800 instead of 1800x1200
+  bool fast = false;             // Fast mode: two thirds of the native size
   // result
   int result = 0;                // 1 shrunk, 0 not shrunk (original still usable), -1 failed mid-way
   uint8_t* out = nullptr;
@@ -1422,11 +1422,13 @@ static size_t drain(Client& d) {
 
 // =============================================================== shrink to print size
 // The SELPHY only reads photo data at roughly 45 KB/s, so the fewer bytes it gets, the sooner it
-// prints. Its 4x6 prints are about 1800x1200 pixels at 300 dpi, so anything bigger is wasted.
+// prints. A SELPHY 4x6 (postcard) print is 1872x1248 dots: 300 dpi plus the bleed it prints past the
+// paper's edges for borderless prints. Sending exactly that size means the printer neither scales
+// nor leaves a margin.
 // The photo is decoded as it arrives, averaged down to that size, turned upright using the EXIF
 // orientation, and re-encoded.
-#define PRINT_LONG  1800
-#define PRINT_SHORT 1200
+#define PRINT_LONG  1872
+#define PRINT_SHORT 1248
 
 
 static size_t shrinkIn(JDEC* jd, uint8_t* buf, size_t nd) {
@@ -1873,7 +1875,7 @@ static void shrinkRun(ShrinkJob* j) {
   if (!baseline) { j->why = "progressive JPEG"; return; }
 
   int L = max(j->iw, j->ih), S = min(j->iw, j->ih);
-  int pl = j->fast ? PRINT_LONG * 2 / 3 : PRINT_LONG;      // Fast: 1200x800 (200 dpi on 4x6)
+  int pl = j->fast ? PRINT_LONG * 2 / 3 : PRINT_LONG;      // Fast: 1248x832 (200 dpi on 4x6)
   int ps = j->fast ? PRINT_SHORT * 2 / 3 : PRINT_SHORT;
   // fit: whole photo on the paper (white strips if it isn't 3:2); fill: cover the paper, trim the rest
   float k = j->fill ? max((float)pl / L, (float)ps / S) : min((float)pl / L, (float)ps / S);
@@ -2399,8 +2401,8 @@ static void handleRoot() {
   for (int i = 0; i < 3; i++) h += "<option value=" + String(qs[i]) + (qs[i] == jpegQ ? " selected>" : ">") + qn[i] + "</option>";
   h += "</select></label>"
        "<label>Print detail <select name=speed>";
-  h += String("<option value=0") + (speedMode == 0 ? " selected" : "") + ">Best: 1800x1200 (300 dpi)</option>";
-  h += String("<option value=1") + (speedMode == 1 ? " selected" : "") + ">Fast: 1200x800 (200 dpi), prints sooner</option>";
+  h += String("<option value=0") + (speedMode == 0 ? " selected" : "") + ">Best: 1872x1248 (the printer's native size, 300 dpi)</option>";
+  h += String("<option value=1") + (speedMode == 1 ? " selected" : "") + ">Fast: 1248x832 (200 dpi): the printer has to scale it, so not actually faster</option>";
   h += "</select></label>"
        "<label><input type=checkbox name=usb";
   if (useUsb) h += " checked";

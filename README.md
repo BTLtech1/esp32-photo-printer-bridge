@@ -4,7 +4,7 @@ Print straight from your camera with a ~$10 ESP32-S3 board. Review a shot, press
 
 - **Camera to printer, no phone, computer or router.** The bridge runs its own Wi-Fi network; the camera joins it and sends each photo over Canon's built-in FTP transfer. Works at home or in the field.
 - **USB cable or Wi-Fi to the printer.** Over USB ("IPP over USB") the print starts sooner; over Wi-Fi there's nothing to plug in.
-- **Smart sizing.** Each photo is shrunk to the printer's real resolution (1800 x 1200 on a 4x6 at 300 dpi) and turned upright before it's sent, so big camera files print fast. **Fast** mode (1200 x 800) starts even sooner. Photos that aren't 3:2 are trimmed to fill the paper (or kept whole with white strips, your choice).
+- **Smart sizing.** Each photo is shrunk to the printer's native print size (1872 x 1248 dots for a borderless 4x6) before it's sent, so big camera files print fast and the printer has nothing left to scale. Photos that aren't 3:2 are trimmed to fill the paper (or kept whole with white strips, your choice).
 - **Two print modes.** Print every photo you send, or only photos you've rated in camera (for example 3 stars and up).
 - **Print queue.** Send several photos in a row; they wait their turn while the printer is busy.
 - **Status page.** See the printer, the activity log and the exact camera settings at `http://btl-photo.local`.
