@@ -43,7 +43,7 @@
     <p>Pick the board in the list and click <b>Connect</b>, then follow the prompts. <span class="muted" id="latest"></span></p>
     <p class="muted">The board is usually called <b>USB Single Serial</b>, <b>CH340</b>, <b>CH343</b> or <b>CP210x</b>. Not sure? Click Cancel, unplug the board, click Install again: the one that disappeared is your board.</p>
     <p style="margin-top:16px">
-      <esp-web-install-button manifest="manifest.json">
+      <esp-web-install-button id="installer" manifest="manifest.json">
         <button slot="activate">Install</button>
         <span slot="unsupported">This page only works in <b>Chrome</b> or <b>Edge</b> on a computer.</span>
         <span slot="not-allowed">Open this page over https to install.</span>
@@ -95,6 +95,11 @@
   <p class="muted">Your bridge's own page (printer, activity log, settings): <a href="http://btl-photo.local">http://btl-photo.local</a> or its IP address.</p>
   <p class="muted">Source code and full guide: <a href="https://github.com/BTLtech1/esp32-photo-printer-bridge">github.com/BTLtech1/esp32-photo-printer-bridge</a></p>
 </main>
-<script>fetch('version.json').then(r=>r.json()).then(v=>{document.getElementById('latest').textContent='Latest version: '+v.version+'.';}).catch(()=>{});</script>
+<script>
+// Always fetch the current version list, never a cached copy (otherwise "Update" can go missing).
+const stamp = Date.now();
+document.getElementById('installer').setAttribute('manifest', 'manifest.json?v=' + stamp);
+fetch('version.json?v=' + stamp, {cache: 'no-store'}).then(r=>r.json()).then(v=>{document.getElementById('latest').textContent='Latest version: '+v.version+'.';}).catch(()=>{});
+</script>
 </body>
 </html>
