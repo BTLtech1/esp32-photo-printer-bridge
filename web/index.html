@@ -40,7 +40,7 @@
 
   <div class="card">
     <h2>Step 2: Click Install</h2>
-    <p>Pick the board in the list and click <b>Connect</b>, then follow the prompts.</p>
+    <p>Pick the board in the list and click <b>Connect</b>, then follow the prompts. <span class="muted" id="latest"></span></p>
     <p class="muted">The board is usually called <b>USB Single Serial</b>, <b>CH340</b>, <b>CH343</b> or <b>CP210x</b>. Not sure? Click Cancel, unplug the board, click Install again: the one that disappeared is your board.</p>
     <p style="margin-top:16px">
       <esp-web-install-button manifest="manifest.json">
@@ -58,7 +58,7 @@
     <p>Right after installing, this page asks for your Wi-Fi. Pick your network, type the password and click <b>Connect</b>. Use the same <b>2.4 GHz</b> network as your printer.</p>
     <p>Once it's connected, the dialog shows the bridge's address next to its name (for example <code>http://192.168.1.50</code>). That's the bridge's own page: it shows the printer, the activity log and the address to type into the camera. You can also reach it at <b>http://btl-photo.local</b>.</p>
     <p class="muted"><b>Stuck on "Wrapping up"?</b> The firmware is already installed; the browser just couldn't reopen the port. Reload this page, click Install again, pick the port, and choose <b>Connect to Wi-Fi</b>.</p>
-    <p class="muted"><b>Already installed?</b> Click Install, connect, and choose <b>Change Wi-Fi</b>, or read the bridge's address from the dialog.</p>
+    <p class="muted"><b>Already installed?</b> Click Install and connect: the dialog shows the version on the board and offers <b>Update</b> when a newer one is available, plus <b>Change Wi-Fi</b>. Give the board half a minute after an install before connecting again.</p>
     <p class="muted"><b>No Wi-Fi prompt at all?</b> The bridge makes its own Wi-Fi network called <b>BTL-Photo-Setup</b>. Join it from your phone and go to <code>http://192.168.4.1</code> to enter your Wi-Fi there.</p>
   </div>
 
@@ -92,7 +92,9 @@
     <p><b>Print every photo the camera sends</b>, or <b>only photos rated</b> 1&ndash;5 stars or more (rate in the camera, then send a batch). Photos are shrunk to the printer's resolution and turned upright before printing; <b>Fast</b> mode sends a lighter file that starts printing sooner. Photos that aren't 3:2 are trimmed to fill the paper, unless you turn <b>Fill the paper</b> off.</p>
   </details>
 
+  <p class="muted">Your bridge's own page (printer, activity log, settings): <a href="http://btl-photo.local">http://btl-photo.local</a> or its IP address.</p>
   <p class="muted">Source code and full guide: <a href="https://github.com/BTLtech1/esp32-photo-printer-bridge">github.com/BTLtech1/esp32-photo-printer-bridge</a></p>
 </main>
+<script>fetch('version.json').then(r=>r.json()).then(v=>{document.getElementById('latest').textContent='Latest version: '+v.version+'.';}).catch(()=>{});</script>
 </body>
 </html>

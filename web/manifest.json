@@ -1,5 +1,5 @@
 {
-  "name": "BTL Photo Printer Bridge for your ESP32-S3",
+  "name": "BTL Photo Printer Bridge",
   "version": "__VERSION__",
   "new_install_prompt_erase": true,
   "new_install_improv_wait_time": 15,

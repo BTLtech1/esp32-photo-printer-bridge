@@ -52,8 +52,8 @@ jobs:
           FW=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' btl-photo-bridge/btl-photo-bridge.ino)
           echo "{\"version\":\"$FW\"}" > site/version.json
           cat site/version.json
-          VERSION="${FW}-${GITHUB_SHA::7}"
-          sed "s/__VERSION__/${VERSION}/" web/manifest.json > site/manifest.json
+          # Version must match FW_VERSION exactly: that's how the installer knows a board is already up to date.
+          sed "s/__VERSION__/${FW}/" web/manifest.json > site/manifest.json
           cat site/manifest.json
 
       - uses: actions/upload-pages-artifact@v3
