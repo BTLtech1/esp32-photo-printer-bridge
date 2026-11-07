@@ -1,0 +1,11 @@
+{
+  "name": "BTL Photo Printer Bridge for your ESP32-S3",
+  "version": "__VERSION__",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [{ "path": "firmware/btl-photo-bridge.bin", "offset": 0 }]
+    }
+  ]
+}

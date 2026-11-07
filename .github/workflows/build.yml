@@ -1,0 +1,66 @@
+name: Build firmware and install page
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      # 3.1.1 on purpose: the newer 3.3.x cores don't finish connecting USB devices yet.
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.1.1
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32s3:CDCOnBoot=default,USBMode=hwcdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" \
+            --export-binaries --output-dir build btl-photo-bridge
+          ls -la build
+
+      - name: Assemble install page
+        run: |
+          mkdir -p site/firmware
+          cp build/btl-photo-bridge.ino.merged.bin site/firmware/btl-photo-bridge.bin
+          cp build/btl-photo-bridge.ino.bin site/firmware/btl-photo-bridge-app.bin
+          cp web/index.html site/index.html
+          FW=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' btl-photo-bridge/btl-photo-bridge.ino)
+          echo "{\"version\":\"$FW\"}" > site/version.json
+          cat site/version.json
+          VERSION="${FW}-${GITHUB_SHA::7}"
+          sed "s/__VERSION__/${VERSION}/" web/manifest.json > site/manifest.json
+          cat site/manifest.json
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
