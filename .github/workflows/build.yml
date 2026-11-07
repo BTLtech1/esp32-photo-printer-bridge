@@ -42,19 +42,20 @@ jobs:
       - name: Assemble install page
         run: |
           mkdir -p site/firmware
+          FW=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' btl-photo-bridge/btl-photo-bridge.ino)
           # Four separate parts instead of one padded 16 MB image: installs in seconds and leaves saved settings alone.
-          cp build/btl-photo-bridge.ino.bootloader.bin site/firmware/bootloader.bin
-          cp build/btl-photo-bridge.ino.partitions.bin site/firmware/partitions.bin
-          cp "$(find ~/.arduino15/packages/esp32/hardware/esp32 -name boot_app0.bin | head -1)" site/firmware/boot_app0.bin
-          cp build/btl-photo-bridge.ino.bin site/firmware/btl-photo-bridge.bin
-          cp build/btl-photo-bridge.ino.merged.bin site/firmware/btl-photo-bridge-full.bin
+          # File names carry the version so browsers never reuse a cached older firmware.
+          cp build/btl-photo-bridge.ino.bootloader.bin "site/firmware/bootloader-${FW}.bin"
+          cp build/btl-photo-bridge.ino.partitions.bin "site/firmware/partitions-${FW}.bin"
+          cp "$(find ~/.arduino15/packages/esp32/hardware/esp32 -name boot_app0.bin | head -1)" "site/firmware/boot_app0-${FW}.bin"
+          cp build/btl-photo-bridge.ino.bin "site/firmware/btl-photo-bridge-${FW}.bin"
+          cp build/btl-photo-bridge.ino.merged.bin "site/firmware/btl-photo-bridge-${FW}-full.bin"
           ls -la site/firmware
           cp web/index.html site/index.html
-          FW=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' btl-photo-bridge/btl-photo-bridge.ino)
           echo "{\"version\":\"$FW\"}" > site/version.json
           cat site/version.json
           # Version must match FW_VERSION exactly: that's how the installer knows a board is already up to date.
-          sed "s/__VERSION__/${FW}/" web/manifest.json > site/manifest.json
+          sed "s/__VERSION__/${FW}/g" web/manifest.json > site/manifest.json
           cat site/manifest.json
 
       - uses: actions/upload-pages-artifact@v3
