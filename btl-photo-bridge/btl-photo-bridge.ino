@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.2   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.3   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.2"
+#define FW_VERSION    "0.6.3"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -1254,12 +1254,16 @@ class CamData : public Client {
     } else if (l) tcp_abort(l);
     UNLOCK_TCPIP_CORE();
     if (!lst) blog("Camera link: couldn't listen on port %u", port);
+    else blog("Camera data link listening on port %u (window %u KB)", port, CAM_WND / 1024);
   }
 
   // Waits for the camera to connect to the data port.
   bool open(uint32_t timeoutMs) {
     uint32_t t = millis();
-    while (!accepted) { if (millis() - t > timeoutMs) return false; delay(2); }
+    while (!accepted) {
+      if (millis() - t > timeoutMs) { blog("Camera data link: the camera didn't connect to port %u (seen %lu connections so far)", FTP_PASV_PORT, (unsigned long)accepts); return false; }
+      delay(2);
+    }
     return true;
   }
 
@@ -1300,6 +1304,7 @@ class CamData : public Client {
   StaticStreamBuffer_t ringCtl;
   uint8_t* ringMem = nullptr;
   volatile bool accepted = false, closed = false, clamped = false;
+  volatile uint32_t accepts = 0, inBytes = 0;
 
   size_t windowNow() { size_t f = ring ? xStreamBufferSpacesAvailable(ring) : 0; return f < CAM_WND ? f : CAM_WND; }
 
@@ -1322,8 +1327,10 @@ class CamData : public Client {
 
   static err_t onAccept(void* arg, tcp_pcb* np, err_t err) {
     CamData* self = (CamData*)arg;
-    if (err != ERR_OK || !np) return ERR_VAL;
-    if (self->pcb) { tcp_abort(np); return ERR_ABRT; }   // one connection at a time
+    if (err != ERR_OK || !np) { blog("Camera data link: accept error %d", (int)err); return ERR_VAL; }
+    self->accepts++;
+    if (self->pcb) { blog("Camera data link: refused a second connection"); tcp_abort(np); return ERR_ABRT; }   // one at a time
+    self->inBytes = 0;
     if (self->ring) xStreamBufferReset(self->ring);
     self->closed = false; self->clamped = false;
     tcp_arg(np, self);
@@ -1340,6 +1347,7 @@ class CamData : public Client {
     CamData* self = (CamData*)arg;
     if (!pb) {                                            // the camera closed its side: the file is complete
       self->closed = true;
+      if (self->inBytes < 1024) blog("Camera data link: camera closed after %lu bytes", (unsigned long)self->inBytes);
       tcp_arg(p, nullptr); tcp_recv(p, nullptr); tcp_err(p, nullptr);
       self->pcb = nullptr;
       if (tcp_close(p) != ERR_OK) tcp_abort(p);
@@ -1348,16 +1356,18 @@ class CamData : public Client {
     if (err != ERR_OK) { pbuf_free(pb); return ERR_OK; }
     if (xStreamBufferSpacesAvailable(self->ring) < pb->tot_len) return ERR_MEM;   // keep it, lwIP offers it again
     for (pbuf* q = pb; q; q = q->next) xStreamBufferSend(self->ring, q->payload, q->len, 0);
+    self->inBytes += pb->tot_len;
     pbuf_free(pb);
     self->setWindow(p);
     return ERR_OK;
   }
 
-  static void onErr(void* arg, err_t) {                   // connection reset or dropped; the pcb is gone already
+  static void onErr(void* arg, err_t e) {                 // connection reset or dropped; the pcb is gone already
     CamData* self = (CamData*)arg;
     if (!self) return;
     self->pcb = nullptr;
     self->closed = true;
+    blog("Camera data link: connection lost (%d)", (int)e);
   }
 };
 CamData camData;
@@ -2028,7 +2038,8 @@ static void ftpSession(WiFiClient& c) {
     else if (cmd == "STAT") ftpSend(c, "211 BTL Photo Printer Bridge");
     else ftpSend(c, "502 Not implemented");
   }
-  blog("Camera disconnected");
+  if (trace.length()) blog("Camera disconnected without sending; it did: %s", trace.c_str());
+  else blog("Camera disconnected");
 }
 
 static void ftpTask(void*) {
