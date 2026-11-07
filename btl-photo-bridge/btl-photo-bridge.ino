@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.5.0   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.5.1   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -19,7 +19,8 @@
     PSRAM: OPI PSRAM (N16R8 boards)
   (With USB CDC On Boot: Enabled it still works, but over Wi-Fi only.)
 
-  Wi-Fi: on first start (or if it can't connect) the bridge opens a Wi-Fi network called
+  Wi-Fi: the web installer asks for your Wi-Fi right after installing (Improv over the UART port).
+  Otherwise, on first start (or if it can't connect) the bridge opens a Wi-Fi network called
   "BTL-Photo-Setup": join it and browse to http://192.168.4.1 to enter your Wi-Fi.
 
   MIT License. Made by BTL. JPEG decoding uses TJpgDec (C)ChaN, see btl_tjpgd.c.
@@ -41,8 +42,9 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/usb_serial_jtag_reg.h"
+#include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.5.0"
+#define FW_VERSION    "0.5.1"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -1944,6 +1946,28 @@ static void handleSetupPage() {
 }
 
 // =============================================================== Wi-Fi
+ImprovSerial improv(Serial);
+uint32_t restartAt = 0;                         // set when new Wi-Fi was saved; restart into normal mode
+
+// Called by the web installer with the Wi-Fi name and password typed on the install page.
+bool improvConnect(const char *ssid, const char *password) {
+  WiFi.disconnect();
+  WiFi.mode(setupMode ? WIFI_AP_STA : WIFI_STA);
+  WiFi.begin(ssid, password);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
+  if (WiFi.status() != WL_CONNECTED) return false;
+  prefs.putString("ssid", ssid); prefs.putString("pass", password);
+  blog("Wi-Fi set from the installer: %s, %s", ssid, WiFi.localIP().toString().c_str());
+  restartAt = millis() + 4000;                  // after the installer shows "connected"
+  return true;
+}
+
+static void serviceImprov() {
+  improv.handle();
+  if (restartAt && (int32_t)(millis() - restartAt) > 0) ESP.restart();
+}
+
 static bool connectWifi() {
   WiFi.setHostname(HOSTNAME);
   WiFi.mode(WIFI_STA);
@@ -1965,7 +1989,10 @@ static bool connectWifi() {
   }
   Serial.print("Connecting to Wi-Fi");
   uint32_t t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) { delay(300); Serial.print("."); }
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) {   // answer the installer while waiting
+    for (int i = 0; i < 30; i++) { serviceImprov(); delay(10); }
+    Serial.print(".");
+  }
   Serial.println();
   return WiFi.status() == WL_CONNECTED;
 }
@@ -2001,6 +2028,7 @@ void setup() {
   ftpUser = prefs.getString("fuser", "btl");
   ftpPass = prefs.getString("fpass", "print");
 
+  improv.begin("BTL Photo Printer Bridge", FW_VERSION, "ESP32-S3", "BTL Photo Printer Bridge", improvConnect);
   prevLog = esp_log_set_vprintf(logHook);
   esp_log_level_set("*", ESP_LOG_ERROR);
   usbStart();                                     // before Wi-Fi, same order as the label bridge
@@ -2041,6 +2069,7 @@ void setup() {
 }
 
 void loop() {
+  serviceImprov();
   server.handleClient();
   delay(2);
 }
