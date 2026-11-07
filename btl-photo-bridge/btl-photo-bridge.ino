@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.8   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.9   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.8"
+#define FW_VERSION    "0.6.9"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -146,6 +146,7 @@ struct ShrinkJob {
   void* enc = nullptr;
   bool encFail = false;
   uint32_t tRecv = 0, tDec = 0, tEnc = 0, tDecOnly = 0;
+  bool encTwoCores = false;
 };
 class CamData;                 // camera data link, defined below (declared here for Arduino's auto-prototypes)
 std::deque<Job>     jobs;
@@ -1598,10 +1599,13 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   j->cw = cwF; j->ch = chF; j->cx0 = (j->sw - j->cw) / 2; j->cy0 = (j->sh - j->ch) / 2;
   j->fw = j->tw; j->fh = j->th;
 
+  // The resampler's accumulators go first so they get internal RAM (they're hit for every pixel);
+  // the codec's own buffers come after and may spill into external RAM instead.
+  if (!shrinkPrepareResampler(j)) { shrinkFreeWork(j); blog("Fast resizer: not enough memory for the resampler"); return false; }
   jpeg_dec_config_t dc = {};
   dc.output_type = JPEG_PIXEL_FORMAT_RGB888; dc.rotate = JPEG_ROTATE_0D; dc.block_enable = true;
   jpeg_dec_handle_t dec = nullptr;
-  if (jpeg_dec_open(&dc, &dec) != JPEG_ERR_OK || !dec) { blog("Fast decoder: couldn't start"); return false; }
+  if (jpeg_dec_open(&dc, &dec) != JPEG_ERR_OK || !dec) { shrinkFreeWork(j); blog("Fast decoder: couldn't start"); return false; }
   jpeg_dec_io_t io = {};
   io.inbuf = (uint8_t*)j->hb; io.inbuf_len = (int)j->hn; io.inbuf_remain = (int)j->hn;
   jpeg_dec_header_info_t hi = {};
@@ -1610,26 +1614,34 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
       jpeg_dec_get_outbuf_len(dec, &blkLen) != JPEG_ERR_OK || blkLen < j->iw * 3 ||
       jpeg_dec_get_process_count(dec, &count) != JPEG_ERR_OK || count < 1) {
     blog("Fast decoder: can't read this file (reports %ux%u, expected %dx%d)", hi.width, hi.height, j->iw, j->ih);
-    jpeg_dec_close(dec); return false;
+    jpeg_dec_close(dec); shrinkFreeWork(j); return false;
   }
   uint8_t* blk = (uint8_t*)heap_caps_aligned_alloc(16, blkLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!blk) { blog("Fast decoder: no memory for a block (%d bytes)", blkLen); jpeg_dec_close(dec); return false; }
+  if (!blk) { blog("Fast decoder: no memory for a block (%d bytes)", blkLen); jpeg_dec_close(dec); shrinkFreeWork(j); return false; }
   io.outbuf = blk;
 
   jpeg_enc_config_t ec = {};
   ec.width = j->fw; ec.height = j->fh; ec.src_type = JPEG_PIXEL_FORMAT_RGB888; ec.subsampling = JPEG_SUBSAMPLE_420;
   ec.quality = j->quality; ec.rotate = JPEG_ROTATE_0D;
-  ec.task_enable = true; ec.hfm_task_priority = 6; ec.hfm_task_core = 0;   // half the encoding on the other core
+  // Two cores for the encoder when there's internal RAM to spare for its helper, else one.
+  bool twoCores = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > 110 * 1024;
+  ec.task_enable = twoCores; ec.hfm_task_priority = 6; ec.hfm_task_core = 0;
   jpeg_enc_handle_t enc = nullptr;
-  if (jpeg_enc_open(&ec, &enc) != JPEG_ERR_OK || !enc) { blog("Fast encoder: couldn't start for %dx%d", j->fw, j->fh); free(blk); jpeg_dec_close(dec); return false; }
+  if (jpeg_enc_open(&ec, &enc) != JPEG_ERR_OK || !enc) {
+    if (twoCores) { ec.task_enable = false; twoCores = false; enc = nullptr; }
+    if (!twoCores && (jpeg_enc_open(&ec, &enc) != JPEG_ERR_OK || !enc)) {
+      blog("Fast encoder: couldn't start for %dx%d", j->fw, j->fh); free(blk); jpeg_dec_close(dec); shrinkFreeWork(j); return false;
+    }
+  }
+  j->encTwoCores = twoCores;
   int bs = jpeg_enc_get_block_size(enc);
-  if (bs <= 0 || bs % (j->fw * 3)) { blog("Fast encoder: unexpected block size %d", bs); jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false; }
+  if (bs <= 0 || bs % (j->fw * 3)) { blog("Fast encoder: unexpected block size %d", bs); jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); shrinkFreeWork(j); return false; }
   j->bandRows = bs / (j->fw * 3); j->bandBytes = bs;
   j->bandOut = (uint8_t*)heap_caps_aligned_alloc(16, bs, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   j->outCap = 768 * 1024;
   j->out = (uint8_t*)bigAlloc(j->outCap);
   j->enc = enc;
-  if (!j->bandOut || !j->out || !shrinkPrepareResampler(j)) {
+  if (!j->bandOut || !j->out) {
     blog("Fast resizer: not enough memory (largest free PSRAM block %u KB)", (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
     shrinkFreeWork(j); free(j->bandOut); j->bandOut = nullptr; free(j->out); j->out = nullptr; j->outCap = 0; j->enc = nullptr;
     jpeg_enc_close(enc); free(blk); jpeg_dec_close(dec); return false;
@@ -1665,10 +1677,10 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   size_t inBytes = j->hn;
   char b[200];
   bool cropped = j->cw < j->sw || j->ch < j->sh;
-  snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (camera %.1f s at %u KB/s, decode %.1f s, resize %.1f s, encode %.1f s)",
+  snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (camera %.1f s at %u KB/s, decode %.1f s, resize %.1f s, encode %.1f s%s)",
            j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(), cropped ? " (edges trimmed to fill the paper)" : "",
            (millis() - t0) / 1000.0, j->tRecv / 1000.0, j->tRecv ? (unsigned)(j->rxBytes / j->tRecv) : 0u, j->tDecOnly / 1000.0,
-           (j->tDec - j->tDecOnly) / 1000.0, j->tEnc / 1000.0);
+           (j->tDec - j->tDecOnly) / 1000.0, j->tEnc / 1000.0, j->encTwoCores ? " on 2 cores" : "");
   j->info = b;
   j->result = 1;
   return true;
