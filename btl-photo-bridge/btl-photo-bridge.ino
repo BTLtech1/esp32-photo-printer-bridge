@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.7   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.8   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.7"
+#define FW_VERSION    "0.6.8"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -1681,15 +1681,22 @@ static void shrinkFreeWork(ShrinkJob* j) {
 
 // Mapping tables and accumulators for the box resampler (needs sw, sh, tw, th and the crop set).
 static bool shrinkPrepareResampler(ShrinkJob* j) {
-  j->W = 3;                                             // output rows open at once (row-by-row processing)
+  j->W = 2;                                             // output rows open at once: a source row touches at most two
   j->base = 0;
   j->ox0   = (uint16_t*)fastAlloc((size_t)j->sw * 2);  // small tables: keep them in fast internal RAM
   j->wx0   = (uint16_t*)fastAlloc((size_t)j->sw * 2);
   j->oy0   = (uint16_t*)fastAlloc((size_t)j->sh * 2);
   j->wy0   = (uint16_t*)fastAlloc((size_t)j->sh * 2);
-  size_t sumBytes = (size_t)j->W * j->tw * 3 * sizeof(uint32_t);
-  j->sums  = (uint32_t*)fastAlloc(sumBytes);
-  j->hrow  = (uint32_t*)fastAlloc((size_t)j->tw * 3 * sizeof(uint32_t));
+  // The accumulators are hit for every pixel: they must be in internal RAM (external RAM is ~10x slower here).
+  size_t sumBytes = (size_t)j->W * j->tw * 3 * sizeof(uint32_t), rowBytes = (size_t)j->tw * 3 * sizeof(uint32_t);
+  j->sums  = (uint32_t*)heap_caps_malloc(sumBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  j->hrow  = (uint32_t*)heap_caps_malloc(rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!j->sums || !j->hrow) {
+    blog("Resizer: only %u KB of internal RAM free (largest block %u KB), using slow external RAM for the accumulators",
+         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    if (!j->sums) j->sums = (uint32_t*)bigAlloc(sumBytes);
+    if (!j->hrow) j->hrow = (uint32_t*)bigAlloc(rowBytes);
+  }
   if (!j->ox0 || !j->wx0 || !j->oy0 || !j->wy0 || !j->sums || !j->hrow) return false;
   memset(j->sums, 0, sumBytes);
   // Within the crop, source pixel x spans [x*tw, (x+1)*tw) and output pixel o spans [o*cw, (o+1)*cw)
@@ -2504,7 +2511,8 @@ void setup() {
   if (wifiOk) improvShowAddress();
 
   if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
-  if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF");
+  if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s, %u KB internal RAM free)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF",
+                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
   else blog("Home Wi-Fi not connected - page at http://%s on the camera network  (PSRAM %s)", AP_IP.toString().c_str(), psramFound() ? "on" : "OFF");
   MDNS.begin(HOSTNAME);
   MDNS.addService("http", "tcp", 80);
