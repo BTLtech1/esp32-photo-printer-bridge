@@ -2452,7 +2452,7 @@ static void handleRoot() {
        "<button name=new value=1 style='padding:4px 10px'>New cassette</button> <button style='padding:4px 10px'>Save size</button></form></td></tr>"
        "<tr><td>Paper in tray</td><td><span id=pp>&hellip;</span>"
        "<form method=post action=/paper style='display:inline;margin-left:8px'>"
-       "loaded <input name=cap type=number min=1 max=18 style='width:4.5em' value=" + String(paperCap) + "> "
+       "loaded <input name=cap type=number min=1 max=40 style='width:4.5em' value=" + String(paperCap) + "> "
        "<button style='padding:4px 10px'>Paper loaded</button></form></td></tr>"
        "<tr><td>Mode</td><td>";
   if (printMode == 1) h += "Only photos rated " + String(minRating) + "&#9733; or more";
@@ -2655,7 +2655,7 @@ static void handleStatus() {
 
 static void handlePaper() {
   int c = server.arg("cap").toInt();
-  if (c >= 1 && c <= 18) { paperCap = c; prefs.putInt("pcap", paperCap); }
+  if (c >= 1 && c <= 40) { paperCap = c; prefs.putInt("pcap", paperCap); }
   paperUsed = 0; prefs.putInt("pused", 0);
   blog("Paper loaded: %d sheets", paperCap);
   redirectHome();
