@@ -37,26 +37,23 @@ jobs:
             --fqbn "esp32:esp32:esp32s3:CDCOnBoot=default,USBMode=hwcdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" \
             --export-binaries --output-dir build btl-photo-bridge
           ls -la build
-          # Test build with Arduino IDE's default flash size and partition table
-          arduino-cli compile \
-            --fqbn "esp32:esp32:esp32s3:CDCOnBoot=default,USBMode=hwcdc,FlashSize=4M,PSRAM=opi,PartitionScheme=default" \
-            --export-binaries --output-dir build4m btl-photo-bridge
-          ls -la build4m
 
       - name: Assemble install page
         run: |
           mkdir -p site/firmware
-          cp build/btl-photo-bridge.ino.merged.bin site/firmware/btl-photo-bridge.bin
-          cp build/btl-photo-bridge.ino.bin site/firmware/btl-photo-bridge-app.bin
-          cp build4m/btl-photo-bridge.ino.merged.bin site/firmware/btl-photo-bridge-4m.bin
-          cp web/test-4m.html site/test-4m.html
+          # Four separate parts instead of one padded 16 MB image: installs in seconds and leaves saved settings alone.
+          cp build/btl-photo-bridge.ino.bootloader.bin site/firmware/bootloader.bin
+          cp build/btl-photo-bridge.ino.partitions.bin site/firmware/partitions.bin
+          cp "$(find ~/.arduino15/packages/esp32/hardware/esp32 -name boot_app0.bin | head -1)" site/firmware/boot_app0.bin
+          cp build/btl-photo-bridge.ino.bin site/firmware/btl-photo-bridge.bin
+          cp build/btl-photo-bridge.ino.merged.bin site/firmware/btl-photo-bridge-full.bin
+          ls -la site/firmware
           cp web/index.html site/index.html
           FW=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' btl-photo-bridge/btl-photo-bridge.ino)
           echo "{\"version\":\"$FW\"}" > site/version.json
           cat site/version.json
           VERSION="${FW}-${GITHUB_SHA::7}"
           sed "s/__VERSION__/${VERSION}/" web/manifest.json > site/manifest.json
-          sed "s/__VERSION__/${VERSION}-4m/; s#firmware/btl-photo-bridge.bin#firmware/btl-photo-bridge-4m.bin#" web/manifest.json > site/manifest-4m.json
           cat site/manifest.json
 
       - uses: actions/upload-pages-artifact@v3

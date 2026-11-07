@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.5.2   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.5.3   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -44,7 +44,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.5.2"
+#define FW_VERSION    "0.5.3"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -153,6 +153,7 @@ static int logHook(const char* fmt, va_list ap) {
   vsnprintf(b, sizeof(b), fmt, ap2);
   va_end(ap2);
   int r = prevLog ? prevLog(fmt, ap) : 0;
+  if (b[0] != 'E' && b[0] != 'W' && !(b[0] == 0x1B && (strstr(b, "E (") || strstr(b, "W (")))) return r;   // only errors and warnings
   String line;                                    // drop colour codes and line breaks
   for (const char* c = b; *c; c++) {
     if (*c == 0x1B) { while (*c && *c != 'm') c++; if (!*c) break; continue; }
@@ -1971,7 +1972,9 @@ static void serviceImprov() {
 static bool connectWifi() {
   WiFi.setHostname(HOSTNAME);
   WiFi.mode(WIFI_STA);
+  bootMark("Wi-Fi started");
   WiFi.setSleep(false);
+  bootMark("Wi-Fi sleep off");
   String s = prefs.getString("ssid", ""), p = prefs.getString("pass", "");
   if (s.length()) {
     WiFi.begin(s.c_str(), p.c_str());
@@ -1984,9 +1987,11 @@ static bool connectWifi() {
       memcpy(ss, conf.sta.ssid, 32); memcpy(pp, conf.sta.password, 64);
       WiFi.begin(ss, pp);
     } else {
+      bootMark("no saved Wi-Fi");
       return false;
     }
   }
+  bootMark("connecting to saved Wi-Fi");
   Serial.println("Connecting to Wi-Fi");          // no dots: they'd hide the installer's replies
   uint32_t t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) { serviceImprov(); delay(10); }
@@ -1997,7 +2002,9 @@ static void startSetupPortal() {
   setupMode = true;
   serviceImprov();
   WiFi.mode(WIFI_AP_STA);
+  bootMark("scanning networks");
   int n = WiFi.scanNetworks();
+  bootMark("scan done");
   for (int i = 0; i < n; i++) { String s = WiFi.SSID(i); if (s.length()) scannedNets.push_back(s); }
   WiFi.softAP("BTL-Photo-Setup");
   Serial.println("Setup mode: join Wi-Fi 'BTL-Photo-Setup' and open http://192.168.4.1");
@@ -2008,10 +2015,18 @@ static void startSetupPortal() {
 }
 
 // =============================================================== setup / loop
+static void bootMark(const char* what) {         // progress markers in Serial Monitor, to see where a boot stops
+  Serial.printf("[boot %lu ms] %s  (heap %u)\n", (unsigned long)millis(), what, (unsigned)ESP.getFreeHeap());
+  Serial.flush();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\nBTL Photo Printer Bridge v" FW_VERSION);
+  Serial.printf("[boot] %s rev %d, flash %u MB, PSRAM %u MB, reset reason %d\n", ESP.getChipModel(), ESP.getChipRevision(),
+                (unsigned)(ESP.getFlashChipSize() >> 20), (unsigned)(ESP.getPsramSize() >> 20), (int)esp_reset_reason());
+  Serial.flush();
   printerMtx = xSemaphoreCreateMutex();
   dataMtx = xSemaphoreCreateMutex();
 
@@ -2025,11 +2040,16 @@ void setup() {
   ftpUser = prefs.getString("fuser", "btl");
   ftpPass = prefs.getString("fpass", "print");
 
+  bootMark("settings loaded");
   improv.begin("BTL Photo Printer Bridge", FW_VERSION, "ESP32-S3", "BTL Photo Printer Bridge", improvConnect);
   prevLog = esp_log_set_vprintf(logHook);
-  esp_log_level_set("*", ESP_LOG_ERROR);
+  esp_log_level_set("*", ESP_LOG_INFO);           // chatty until Wi-Fi is up, so boot problems show in Serial Monitor
   usbStart();                                     // before Wi-Fi, same order as the label bridge
-  if (!connectWifi()) { startSetupPortal(); return; }
+  bootMark("USB host starting");
+  bool wifiOk = connectWifi();
+  esp_log_level_set("*", ESP_LOG_ERROR);
+  if (!wifiOk) { bootMark("no Wi-Fi: opening setup network"); startSetupPortal(); bootMark("setup network ready"); return; }
+  bootMark("Wi-Fi connected");
 
   blog("Bridge ready at http://%s  (PSRAM %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF");
   MDNS.begin(HOSTNAME);
