@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.6   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.7   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.6"
+#define FW_VERSION    "0.6.7"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -76,6 +76,7 @@ int    minRating = 3;
 bool   shrinkOn  = true;     // shrink photos to print size before sending
 bool   fillOn    = true;     // crop photos to the paper's 3:2 shape instead of leaving white strips
 bool   scaleFill = true;     // ask the printer to scale the photo to fill the paper (IPP print-scaling=fill)
+bool   dryRun    = false;    // test mode: process photos but don't print them
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1800x1200, 300 dpi), 1 = Fast (1200x800, half-size decode)
 bool   useUsb    = true;     // print over USB when the printer is plugged in
@@ -1908,6 +1909,11 @@ static String ftpStor(Client& d, const String& path) {
     }
     if (sj.result == 1) {
       free(hb);
+      if (dryRun) {
+        free(sj.out);
+        blog("Test mode, not printed: %s (%s) - %s", name.c_str(), stars(rating).c_str(), sj.info.c_str());
+        return "226 Transfer complete (test mode)";
+      }
       enqueueJob(sj.out, sj.outLen, name, rating);
       blog("Received %s (%s) - %s", name.c_str(), stars(rating).c_str(), sj.info.c_str());
       return "226 Transfer complete";
@@ -1919,6 +1925,13 @@ static String ftpStor(Client& d, const String& path) {
       return "451 Could not process the photo";
     }
     blog("%s: sending the original (%s)", name.c_str(), sj.why.c_str());
+  }
+
+  if (dryRun) {
+    if (!eof) drain(d);
+    free(hb);
+    blog("Test mode, not printed: %s (%s)", name.c_str(), stars(rating).c_str());
+    return "226 Transfer complete (test mode)";
   }
 
   // 4. Printer free and nothing waiting: stream straight through.
@@ -2140,6 +2153,9 @@ static void handleRoot() {
        "<label><input type=checkbox name=pscale";
   if (scaleFill) h += " checked";
   h += "> Borderless <span class=mut>(asks the printer to stretch the photo over the whole sheet; turn off if prints come out wrong)</span></label>"
+       "<label><input type=checkbox name=dry";
+  if (dryRun) h += " checked";
+  h += "> <b>Test mode</b>: process photos but don't print them <span class=mut>(timing shows in the log, no paper used)</span></label>"
        "<label>Quality sent to the printer <select name=q>";
   const int qs[3] = { 75, 85, 95 };
   const char* qn[3] = { "Fast", "Balanced", "Best" };
@@ -2267,7 +2283,7 @@ static void handlePrinterInfo() {
 static void handleStatus() {
   String j = "{";
   xSemaphoreTake(dataMtx, portMAX_DELAY);
-  String pst = printerState == 3 ? "ready" : printerState == 4 ? "printing" : printerState == 5 ? "stopped" : "unknown";
+  String pst = dryRun ? "TEST MODE - nothing will print" : printerState == 3 ? "ready" : printerState == 4 ? "printing" : printerState == 5 ? "stopped" : "unknown";
   String pn = usbIppReady() ? usbName + " (USB cable)"
             : printerFound ? printerName + " (Wi-Fi, " + printerIP.toString() + ")" : String("searching...");
   String us = usbState;
@@ -2289,6 +2305,7 @@ static void handleSettings() {
   shrinkOn = server.hasArg("shrink");
   fillOn = server.hasArg("fill"); prefs.putBool("fill", fillOn);
   scaleFill = server.hasArg("pscale"); prefs.putBool("pscale", scaleFill);
+  dryRun = server.hasArg("dry"); prefs.putBool("dry", dryRun);
   useUsb = server.hasArg("usb");
   speedMode = server.arg("speed").toInt() == 1 ? 1 : 0;
   prefs.putBool("usb", useUsb); prefs.putInt("speed", speedMode);
@@ -2462,6 +2479,7 @@ void setup() {
   apSsid = prefs.getString("apssid", "BTL-Photo");
   apPass = prefs.getString("appass", "printphoto");
   scaleFill = prefs.getBool("pscale", true);
+  dryRun = prefs.getBool("dry", false);
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
   speedMode = prefs.getInt("speed", 0);
