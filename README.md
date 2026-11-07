@@ -2,7 +2,7 @@
 
 Print straight from your camera with a ~$10 ESP32-S3 board. Review a shot, press **SET**, and it comes out of the printer.
 
-- **Camera to printer, no phone or computer.** The camera sends the photo over Wi-Fi (Canon's built-in FTP transfer) and the bridge prints it.
+- **Camera to printer, no phone, computer or router.** The bridge runs its own Wi-Fi network; the camera joins it and sends each photo over Canon's built-in FTP transfer. Works at home or in the field.
 - **USB cable or Wi-Fi to the printer.** Over USB ("IPP over USB") the print starts sooner; over Wi-Fi there's nothing to plug in.
 - **Smart sizing.** Each photo is shrunk to the printer's real resolution (1800 x 1200 on a 4x6 at 300 dpi) and turned upright before it's sent, so big camera files print fast. **Fast** mode (1200 x 800) starts even sooner. Photos that aren't 3:2 are trimmed to fill the paper (or kept whole with white strips, your choice).
 - **Two print modes.** Print every photo you send, or only photos you've rated in camera (for example 3 stars and up).
@@ -26,18 +26,20 @@ Tested with a **Canon EOS R6 Mark II** and a **Canon SELPHY CP1500**. Other came
 
 Open **https://btltech1.github.io/esp32-photo-printer-bridge** in Chrome or Edge, plug the board's **UART** port into your computer and click **Install**.
 
-Right after installing, the page asks for your Wi-Fi (2.4 GHz, the same network as the printer). Once it's connected, the dialog shows the bridge's address next to its name; that's the bridge's page, which also shows the IP address to type into the camera. You can also use **http://btl-photo.local**.
+The bridge starts its own Wi-Fi network, **BTL-Photo** (password `printphoto`). Its page is at **http://192.168.4.1** on that network, and that's also the address the camera sends to. Nothing else is required for printing over the USB cable.
+
+Right after installing, the page also offers to join your home Wi-Fi (2.4 GHz). That's optional: it lets the bridge reach a printer on your Wi-Fi and lets you open its page (**http://btl-photo.local**) from your normal network. Once connected, the installer's dialog shows the bridge's home address next to its name.
 
 If the page sits on "Wrapping up" for more than a minute (some USB-serial chips don't let the browser reopen the port straight after flashing), the firmware is already installed: reload the page, click **Install** again, pick the port, and choose **Connect to Wi-Fi**. The bridge also creates a Wi-Fi network called **BTL-Photo-Setup**: join it and go to `http://192.168.4.1` to enter your Wi-Fi there instead.
 
 ## Camera setup (Canon)
 
-In the camera's network menu, create an **FTP transfer** connection over your Wi-Fi:
+In the camera's network menu, create an **FTP transfer** connection. For the Wi-Fi network pick **BTL-Photo** (password `printphoto`); your home Wi-Fi also works if the bridge is on it.
 
 | Setting | Value |
 |---|---|
 | FTP mode | FTP (not FTPS or SFTP) |
-| Address | the bridge's IP address (shown on its page) |
+| Address | **192.168.4.1** on BTL-Photo (or the bridge's home address, shown on its page) |
 | Port | 21 |
 | Passive mode | Enable |
 | Proxy | Disable |
@@ -46,7 +48,7 @@ In the camera's network menu, create an **FTP transfer** connection over your Wi
 
 Then in **FTP transfer settings**: Automatic transfer **Disable**, Transfer with SET **Enable**, and send **JPEG** only. Press **Playback**, pick a photo, press **SET**.
 
-Reserve the bridge's IP address in your router so the camera always finds it.
+On the BTL-Photo network the address never changes. If you use your home Wi-Fi instead, reserve the bridge's IP address in your router.
 
 ## Printing over USB
 
@@ -73,7 +75,7 @@ The bridge's page shows "SELPHY CP1500 (USB cable)" when it's connected, and **C
 
 | Problem | Fix |
 |---|---|
-| Camera says it can't connect | Check the address on the camera matches the bridge's page, and that both are on the same Wi-Fi. |
+| Camera says it can't connect | On BTL-Photo the address is 192.168.4.1. On home Wi-Fi, check the address on the camera matches the bridge's page. |
 | Camera's SET option is missing | The camera isn't connected to the bridge. Turn the camera off and on. |
 | Photo is "Skipped - not a JPEG" | Set the camera to send JPEG only (RAW files can't be printed). |
 | Printer not found over Wi-Fi | Connect the printer to the same Wi-Fi (on the SELPHY: Wi-Fi settings, Connection Settings, Other, Via Wireless Router). |

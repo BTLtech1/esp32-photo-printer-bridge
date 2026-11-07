@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.5.6   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.0   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -19,9 +19,10 @@
     PSRAM: OPI PSRAM (N16R8 boards)
   (With USB CDC On Boot: Enabled it still works, but over Wi-Fi only.)
 
-  Wi-Fi: the web installer asks for your Wi-Fi right after installing (Improv over the UART port).
-  Otherwise, on first start (or if it can't connect) the bridge opens a Wi-Fi network called
-  "BTL-Photo-Setup": join it and browse to http://192.168.4.1 to enter your Wi-Fi.
+  Wi-Fi: the bridge runs its own network ("BTL-Photo") that the camera connects to directly:
+  one Wi-Fi hop, no router needed, address always 192.168.4.1. It can also join your home Wi-Fi
+  (set from the web installer, or from its page at http://192.168.4.1) for the printer over Wi-Fi
+  and for reaching its page from your normal network.
 
   MIT License. Made by BTL. JPEG decoding uses TJpgDec (C)ChaN, see btl_tjpgd.c.
 */
@@ -44,7 +45,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.5.6"
+#define FW_VERSION    "0.6.0"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -78,8 +79,9 @@ int    speedMode = 0;        // 0 = Best (1800x1200, 300 dpi), 1 = Fast (1200x80
 bool   useUsb    = true;     // print over USB when the printer is plugged in
 String ftpUser   = "btl";
 String ftpPass   = "print";
-bool   setupMode = false;
-std::vector<String> scannedNets;
+bool   apOn   = true;                 // the bridge's own Wi-Fi network for the camera
+String apSsid = "BTL-Photo", apPass = "printphoto";
+static const IPAddress AP_IP(192, 168, 4, 1);
 
 // ---- printer
 IPAddress printerIP;
@@ -1760,7 +1762,7 @@ static void ftpSession(WiFiClient& c) {
     else if (cmd == "REST") ftpSend(c, arg.toInt() == 0 ? "350 OK" : "502 Resume not supported");
     else if (cmd == "PASV") {
       active = false; flushPendingData();
-      IPAddress ip = WiFi.localIP();
+      IPAddress ip = c.localIP();                 // the bridge's address on whichever network the camera came in on
       char b[80];
       snprintf(b, sizeof(b), "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u)", ip[0], ip[1], ip[2], ip[3], FTP_PASV_PORT >> 8, FTP_PASV_PORT & 0xFF);
       ftpSend(c, b);
@@ -1822,12 +1824,15 @@ static const char PAGE_STYLE[] =
   "</style>";
 
 static void handleRoot() {
-  String ip = WiFi.localIP().toString();
-  String h; h.reserve(9000);
+  bool sta = WiFi.status() == WL_CONNECTED;
+  String ip = sta ? WiFi.localIP().toString() : String("not connected");
+  String h; h.reserve(10000);
   h += "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
        "<title>BTL Photo Printer Bridge</title>";
   h += PAGE_STYLE;
-  h += "</head><body><h1>BTL Photo Printer Bridge</h1><div class=mut>v" FW_VERSION " &middot; " + ip + "</div>";
+  h += "</head><body><h1>BTL Photo Printer Bridge</h1><div class=mut>v" FW_VERSION;
+  if (apOn) h += " &middot; camera network <b>" + esc(apSsid) + "</b>: " + AP_IP.toString();
+  h += " &middot; home Wi-Fi: " + ip + "</div>";
 
   if (!psramFound())
     h += "<div class='card warn'>PSRAM is off, so photos can't wait in a queue while the printer is busy. "
@@ -1885,21 +1890,34 @@ static void handleRoot() {
        "<form method=post action=/clearhist><button>Forget which photos were printed</button></form>"
        "<div class=mut style='margin-top:6px'>In star-rating mode each photo prints once; this lets them print again.</div></div>";
 
-  h += "<div class=card><h2>Camera setup (Canon FTP transfer)</h2><table>"
-       "<tr><td>FTP mode</td><td>FTP <span class=mut>(not FTPS or SFTP)</span></td></tr>"
-       "<tr><td>Server address</td><td><b>" + ip + "</b></td></tr>"
+  h += "<div class=card><h2>Camera setup (Canon FTP transfer)</h2><table>";
+  if (apOn)
+    h += "<tr><td>Wi-Fi network</td><td><b>" + esc(apSsid) + "</b>, password <b>" + esc(apPass) + "</b> <span class=mut>(the bridge's own network: fastest, works anywhere)</span>"
+         "<br><span class=mut>or your home Wi-Fi</span></td></tr>"
+         "<tr><td>Server address</td><td><b>" + AP_IP.toString() + "</b> on " + esc(apSsid) + "<span class=mut>, or " + ip + " on your home Wi-Fi</span></td></tr>";
+  else
+    h += "<tr><td>Server address</td><td><b>" + ip + "</b></td></tr>";
+  h += "<tr><td>FTP mode</td><td>FTP <span class=mut>(not FTPS or SFTP)</span></td></tr>"
        "<tr><td>Port</td><td>21</td></tr>"
        "<tr><td>Passive mode</td><td>Enable</td></tr>"
        "<tr><td>Proxy</td><td>Disable</td></tr>"
        "<tr><td>Login</td><td>user <b>" + esc(ftpUser) + "</b>, password <b>" + esc(ftpPass) + "</b></td></tr>"
        "<tr><td>Target folder</td><td>Root folder</td></tr>"
        "<tr><td>FTP transfer settings</td><td>Automatic transfer: Disable<br>Transfer with SET: Enable<br>RAW+JPEG: send JPEG only</td></tr>"
-       "</table><div class=mut style='margin-top:6px'>Tip: reserve this IP address in your router so the camera always finds the bridge.</div></div>";
+       "</table></div>";
 
   h += "<div class=card><h2>Test print</h2><form method=post action=/testprint enctype=multipart/form-data>"
        "<input type=file name=f accept='image/jpeg'> <button>Print this JPEG</button></form></div>";
 
-  h += "<div class=card><details><summary>Change Wi-Fi</summary><form method=post action=/savewifi>"
+  h += "<div class=card><details><summary>Camera network (the bridge's own Wi-Fi)</summary><form method=post action=/apsettings>"
+       "<label><input type=checkbox name=apon";
+  if (apOn) h += " checked";
+  h += "> Run the bridge's own Wi-Fi network for the camera</label>"
+       "<label>Network name <input name=apssid value='" + esc(apSsid) + "' maxlength=31></label>"
+       "<label>Password <input name=appass value='" + esc(apPass) + "' minlength=8 maxlength=63></label>"
+       "<button>Save</button><div class=mut>At least 8 characters. The camera's address on this network is always " + AP_IP.toString() + ".</div></form></details></div>";
+
+  h += "<div class=card><details><summary>Home Wi-Fi (optional: printer over Wi-Fi, page from your normal network)</summary><form method=post action=/savewifi>"
        "<label>Wi-Fi name <input name=ssid></label><label>Password <input name=pass type=password></label>"
        "<button>Save and restart</button><div class=mut>2.4 GHz networks only.</div></form></details></div>";
 
@@ -2067,6 +2085,24 @@ static void handlePreviewDone() {
   free(upBuf); upBuf = nullptr; upLen = 0;
 }
 
+static void startAccessPoint() {
+  if (!apOn) { WiFi.softAPdisconnect(true); return; }
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(apSsid.c_str(), apPass.length() >= 8 ? apPass.c_str() : nullptr, 1, 0, 4);
+}
+
+static void handleApSettings() {
+  bool on = server.hasArg("apon");
+  String ssid = server.arg("apssid"), pass = server.arg("appass");
+  if (!ssid.length() || ssid.length() > 31) { server.send(400, "text/plain", "Network name: 1-31 characters"); return; }
+  if (pass.length() && pass.length() < 8) { server.send(400, "text/plain", "Password: at least 8 characters (or empty for an open network)"); return; }
+  apOn = on; apSsid = ssid; apPass = pass;
+  prefs.putBool("apon", apOn); prefs.putString("apssid", apSsid); prefs.putString("appass", apPass);
+  startAccessPoint();
+  blog(apOn ? "Camera network: %s, address %s" : "Camera network turned off", apSsid.c_str(), AP_IP.toString().c_str());
+  redirectHome();
+}
+
 static void handleSaveWifi() {
   String s = server.arg("ssid"), p = server.arg("pass");
   if (!s.length()) { server.send(400, "text/plain", "Wi-Fi name is required"); return; }
@@ -2074,21 +2110,9 @@ static void handleSaveWifi() {
   server.send(200, "text/html",
     "<meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<body style='font-family:sans-serif;background:#111;color:#eee;padding:16px'><h2>Saved - restarting</h2>"
-    "<p>Switch back to your normal Wi-Fi, then open <b>http://btl-photo.local</b> in about a minute.</p>");
+    "<p>Open <b>http://btl-photo.local</b> from your home Wi-Fi in about a minute (or http://192.168.4.1 from the camera network).</p>");
   delay(1500);
   ESP.restart();
-}
-
-static void handleSetupPage() {
-  String h = "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-             "<title>BTL Photo Printer Setup</title>";
-  h += PAGE_STYLE;
-  h += "</head><body><h1>BTL Photo Printer Bridge setup</h1><div class=card><h2>Connect to your Wi-Fi</h2>"
-       "<form method=post action=/savewifi><label>Wi-Fi name <input name=ssid list=nets required></label><datalist id=nets>";
-  for (auto& n : scannedNets) h += "<option value='" + esc(n) + "'>";
-  h += "</datalist><label>Password <input name=pass type=password></label><button>Save and restart</button>"
-       "<div class=mut style='margin-top:6px'>Use a 2.4 GHz network, the same one your printer is on.</div></form></div></body></html>";
-  server.send(200, "text/html", h);
 }
 
 // =============================================================== Wi-Fi
@@ -2104,7 +2128,6 @@ static void improvShowAddress() {               // the installer shows this as t
 // Called by the web installer with the Wi-Fi name and password typed on the install page.
 bool improvConnect(const char *ssid, const char *password) {
   WiFi.disconnect();
-  WiFi.mode(setupMode ? WIFI_AP_STA : WIFI_STA);
   WiFi.begin(ssid, password);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
@@ -2121,12 +2144,8 @@ static void serviceImprov() {
   if (restartAt && (int32_t)(millis() - restartAt) > 0) ESP.restart();
 }
 
+// Joins the home Wi-Fi if one is saved. The camera network (access point) is already up by then.
 static bool connectWifi() {
-  WiFi.setHostname(HOSTNAME);
-  WiFi.mode(WIFI_STA);
-  bootMark("Wi-Fi started");
-  WiFi.setSleep(false);
-  bootMark("Wi-Fi sleep off");
   String s = prefs.getString("ssid", ""), p = prefs.getString("pass", "");
   if (s.length()) {
     WiFi.begin(s.c_str(), p.c_str());
@@ -2150,22 +2169,6 @@ static bool connectWifi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
-static void startSetupPortal() {
-  setupMode = true;
-  serviceImprov();
-  WiFi.mode(WIFI_AP_STA);
-  bootMark("scanning networks");
-  int n = WiFi.scanNetworks();
-  bootMark("scan done");
-  for (int i = 0; i < n; i++) { String s = WiFi.SSID(i); if (s.length()) scannedNets.push_back(s); }
-  WiFi.softAP("BTL-Photo-Setup");
-  Serial.println("Setup mode: join Wi-Fi 'BTL-Photo-Setup' and open http://192.168.4.1");
-  server.on("/", HTTP_GET, handleSetupPage);
-  server.on("/savewifi", HTTP_POST, handleSaveWifi);
-  server.onNotFound(handleSetupPage);
-  server.begin();
-}
-
 // =============================================================== setup / loop
 static void bootMark(const char* what) {         // progress markers in Serial Monitor, to see where a boot stops
   Serial.printf("[boot %lu ms] %s  (heap %u)\n", (unsigned long)millis(), what, (unsigned)ESP.getFreeHeap());
@@ -2187,6 +2190,9 @@ void setup() {
   minRating = prefs.getInt("minr", 3);
   shrinkOn = prefs.getBool("shrink", true);
   fillOn = prefs.getBool("fill", true);
+  apOn = prefs.getBool("apon", true);
+  apSsid = prefs.getString("apssid", "BTL-Photo");
+  apPass = prefs.getString("appass", "printphoto");
   scaleFill = prefs.getBool("pscale", true);
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
@@ -2200,13 +2206,20 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_INFO);           // chatty until Wi-Fi is up, so boot problems show in Serial Monitor
   usbStart();                                     // before Wi-Fi, same order as the label bridge
   bootMark("USB host starting");
+  WiFi.setHostname(HOSTNAME);
+  WiFi.mode(apOn ? WIFI_AP_STA : WIFI_STA);
+  WiFi.setSleep(false);
+  bootMark("Wi-Fi started");
+  startAccessPoint();
+  if (apOn) bootMark("camera network up");
   bool wifiOk = connectWifi();
   esp_log_level_set("*", ESP_LOG_ERROR);
-  if (!wifiOk) { bootMark("no Wi-Fi: opening setup network"); startSetupPortal(); bootMark("setup network ready"); return; }
-  bootMark("Wi-Fi connected");
-  improvShowAddress();
+  bootMark(wifiOk ? "home Wi-Fi connected" : "no home Wi-Fi (keeps trying in the background)");
+  if (wifiOk) improvShowAddress();
 
-  blog("Bridge ready at http://%s  (PSRAM %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF");
+  if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
+  if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF");
+  else blog("Home Wi-Fi not connected - page at http://%s on the camera network  (PSRAM %s)", AP_IP.toString().c_str(), psramFound() ? "on" : "OFF");
   MDNS.begin(HOSTNAME);
   MDNS.addService("http", "tcp", 80);
   ftpCtl.begin();
@@ -2235,6 +2248,7 @@ void setup() {
   server.on("/testprint", HTTP_POST, handleTestPrintDone, handleTestUpload);
   server.on("/preview", HTTP_POST, handlePreviewDone, handleTestUpload);
   server.on("/savewifi", HTTP_POST, handleSaveWifi);
+  server.on("/apsettings", HTTP_POST, handleApSettings);
   server.begin();
 
   xTaskCreatePinnedToCore(printTask, "print", 12288, nullptr, 1, nullptr, 1);
@@ -2244,5 +2258,12 @@ void setup() {
 void loop() {
   serviceImprov();
   server.handleClient();
+  static bool wasUp = false;                      // home Wi-Fi can come and go; note it in the log
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up != wasUp) {
+    wasUp = up;
+    if (up) { improvShowAddress(); blog("Home Wi-Fi connected: http://%s", WiFi.localIP().toString().c_str()); }
+    else blog("Home Wi-Fi lost - reconnecting in the background (camera network keeps working)");
+  }
   delay(2);
 }

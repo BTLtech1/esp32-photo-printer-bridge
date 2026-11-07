@@ -54,12 +54,12 @@
   </div>
 
   <div class="card">
-    <h2>Step 3: Connect it to your Wi-Fi</h2>
-    <p>Right after installing, this page asks for your Wi-Fi. Pick your network, type the password and click <b>Connect</b>. Use the same <b>2.4 GHz</b> network as your printer.</p>
-    <p>Once it's connected, the dialog shows the bridge's address next to its name (for example <code>http://192.168.1.50</code>). That's the bridge's own page: it shows the printer, the activity log and the address to type into the camera. You can also reach it at <b>http://btl-photo.local</b>.</p>
+    <h2>Step 3: Wi-Fi</h2>
+    <p>The bridge runs its own Wi-Fi network, <b>BTL-Photo</b> (password <code>printphoto</code>). The camera connects to that, and the bridge's page is at <code>http://192.168.4.1</code> on it. For printing over the USB cable that's all you need, at home or in the field.</p>
+    <p>Right after installing, this page also offers to join your <b>home Wi-Fi</b> (2.4 GHz). Optional, but handy: the bridge can then reach a printer on your Wi-Fi, and you can open its page from your normal network at <b>http://btl-photo.local</b>. Once it's connected, the dialog shows that address next to the bridge's name.</p>
     <p class="muted"><b>Stuck on "Wrapping up"?</b> The firmware is already installed; the browser just couldn't reopen the port. Reload this page, click Install again, pick the port, and choose <b>Connect to Wi-Fi</b>.</p>
     <p class="muted"><b>Already installed?</b> Click Install and connect: the dialog shows the version on the board and offers <b>Update</b> when a newer one is available, plus <b>Change Wi-Fi</b>. Give the board half a minute after an install before connecting again.</p>
-    <p class="muted"><b>No Wi-Fi prompt at all?</b> The bridge makes its own Wi-Fi network called <b>BTL-Photo-Setup</b>. Join it from your phone and go to <code>http://192.168.4.1</code> to enter your Wi-Fi there.</p>
+    <p class="muted"><b>No Wi-Fi prompt at all?</b> Join <b>BTL-Photo</b> from your phone, open <code>http://192.168.4.1</code>, and enter your home Wi-Fi under "Home Wi-Fi".</p>
   </div>
 
   <div class="card">
@@ -76,16 +76,16 @@
   <div class="card">
     <h2>Step 5: Set up the camera (Canon FTP transfer)</h2>
     <table>
-      <tr><td>Connection</td><td>FTP transfer, over your Wi-Fi</td></tr>
+      <tr><td>Connection</td><td>FTP transfer, Wi-Fi network <b>BTL-Photo</b> (password <code>printphoto</code>)</td></tr>
       <tr><td>FTP mode</td><td>FTP (not FTPS or SFTP)</td></tr>
-      <tr><td>Address</td><td>the bridge's IP address (shown on its page)</td></tr>
+      <tr><td>Address</td><td><b>192.168.4.1</b></td></tr>
       <tr><td>Port / Passive / Proxy</td><td>21 / Enable / Disable</td></tr>
       <tr><td>Login</td><td>user <b>btl</b>, password <b>print</b> (change them on the bridge's page)</td></tr>
       <tr><td>Target folder</td><td>Root folder</td></tr>
       <tr><td>Transfer settings</td><td>Automatic transfer: Disable &middot; Transfer with SET: Enable &middot; send JPEG only</td></tr>
     </table>
     <p>Now press <b>Playback</b>, pick a photo and press <b>SET</b>. It prints.</p>
-    <p class="muted">Tip: reserve the bridge's IP address in your router so the camera always finds it.</p>
+    <p class="muted">Using your home Wi-Fi instead? Then the address is the one on the bridge's page; reserve it in your router so it doesn't change.</p>
   </div>
 
   <details class="card"><summary>Print modes and settings</summary>
