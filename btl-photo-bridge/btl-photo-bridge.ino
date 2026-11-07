@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.7.1   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.7.2   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.7.1"
+#define FW_VERSION    "0.7.2"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -445,6 +445,13 @@ static bool writeAll(Client& c, const uint8_t* p, size_t n) {
 static void sendChunk(Client& c, const uint8_t* data, size_t len) {
   if (!len) return;
   char hdr[12]; int hl = snprintf(hdr, sizeof(hdr), "%X\r\n", (unsigned)len);
+  if (len <= 16384) {                                   // one write: fewer round trips with the printer
+    uint8_t* b = (uint8_t*)malloc(hl + len + 2);
+    if (b) {
+      memcpy(b, hdr, hl); memcpy(b + hl, data, len); b[hl + len] = '\r'; b[hl + len + 1] = '\n';
+      writeAll(c, b, hl + len + 2); free(b); return;
+    }
+  }
   writeAll(c, (const uint8_t*)hdr, hl); writeAll(c, data, len); writeAll(c, (const uint8_t*)"\r\n", 2);
 }
 
@@ -1509,11 +1516,12 @@ static void shrinkSendTask(void* arg) {
   while (true) {
     xSemaphoreTake(j->outReady, pdMS_TO_TICKS(50));
     size_t have = j->outLen;
-    if (have > j->sinkSent && !j->sinkFail && !j->encFail) {
+    bool last = j->encExited;
+    if (have > j->sinkSent && !j->sinkFail && !j->encFail && (last || have - j->sinkSent >= 32 * 1024)) {
       j->sink(j->sinkCtx, j->out + j->sinkSent, have - j->sinkSent);
       j->sinkSent = have;
     }
-    if (j->encExited && (j->sinkSent >= j->outLen || j->sinkFail || j->encFail)) break;
+    if (last && (j->sinkSent >= j->outLen || j->sinkFail || j->encFail)) break;
   }
   j->sendExited = true;
   vTaskDelete(nullptr);
@@ -1952,12 +1960,26 @@ static void shrinkBlocking(ShrinkJob* j) {
 // Live printing: the print job is opened on the printer before the photo is processed, and the
 // encoded bytes are streamed into it (HTTP chunked) as they're produced.
 static Client* liveClient = nullptr;
+#define LIVE_CHUNK (48 * 1024)
+static uint8_t* liveBuf = nullptr;                       // one chunk (size line + data + line end) in a single write:
+                                                         // every separate write costs a round trip with the printer
 static void liveSink(void* ctx, const uint8_t* d, size_t n) {
   ShrinkJob* j = (ShrinkJob*)ctx;
   if (!liveClient || j->sinkFail) return;
-  char hdr[12]; int hl = snprintf(hdr, sizeof(hdr), "%X\r\n", (unsigned)n);
-  if (!writeAll(*liveClient, (const uint8_t*)hdr, hl) || !writeAll(*liveClient, d, n) || !writeAll(*liveClient, (const uint8_t*)"\r\n", 2))
-    j->sinkFail = true;
+  while (n && !j->sinkFail) {
+    size_t k = n > LIVE_CHUNK ? LIVE_CHUNK : n;
+    if (liveBuf) {
+      int hl = snprintf((char*)liveBuf, 16, "%X\r\n", (unsigned)k);
+      memcpy(liveBuf + hl, d, k);
+      liveBuf[hl + k] = '\r'; liveBuf[hl + k + 1] = '\n';
+      if (!writeAll(*liveClient, liveBuf, hl + k + 2)) j->sinkFail = true;
+    } else {
+      char hdr[12]; int hl = snprintf(hdr, sizeof(hdr), "%X\r\n", (unsigned)k);
+      if (!writeAll(*liveClient, (const uint8_t*)hdr, hl) || !writeAll(*liveClient, d, k) || !writeAll(*liveClient, (const uint8_t*)"\r\n", 2))
+        j->sinkFail = true;
+    }
+    d += k; n -= k;
+  }
 }
 
 // Shrinks a complete JPEG held in memory. On success replaces data/len with the small version.
@@ -2675,6 +2697,7 @@ void setup() {
   ftpPass = prefs.getString("fpass", "print");
 
   if (psramFound()) reserveResampler();            // while internal RAM is still clean
+  liveBuf = (uint8_t*)bigAlloc(LIVE_CHUNK + 32);
   bootMark("settings loaded");
   improv.begin("BTL Photo Printer Bridge", FW_VERSION, "ESP32-S3", improvName, improvConnect);
   prevLog = esp_log_set_vprintf(logHook);
