@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.8.3"
+#define FW_VERSION    "0.8.4"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -2458,8 +2458,13 @@ static void handleRoot() {
        "<tr><td>FTP transfer settings</td><td>Automatic transfer: Disable<br>Transfer with SET: Enable<br>RAW+JPEG: send JPEG only</td></tr>"
        "</table></div>";
 
-  h += "<div class=card><h2>Test print</h2><form method=post action=/testprint enctype=multipart/form-data>"
-       "<input type=file name=f accept='image/jpeg'> <button>Print this JPEG</button></form></div>";
+  h += "<div class=card><h2>Test print</h2><form method=post action=/testprint enctype=multipart/form-data "
+       "onsubmit=\"var f=this.f.files[0],m=" + String((unsigned long)testPrintMax()) + ",o=document.getElementById('tpm');"
+       "if(!f){o.textContent='Choose a JPEG first.';return false}"
+       "if(f.size>m){o.textContent='That file is '+(f.size/1048576).toFixed(1)+' MB; this box takes up to '+(m/1048576).toFixed(1)+' MB. Full-size camera photos: send them from the camera with SET instead.';return false}"
+       "o.textContent='Sending and resizing... the page comes back when it is queued.';\">"
+       "<input type=file name=f accept='image/jpeg'> <button>Print this JPEG</button></form>"
+       "<div id=tpm class=mut style='margin-top:6px'>Up to " + fmtSize(testPrintMax()) + ". Full-size camera photos are bigger than that: send those from the camera.</div></div>";
 
   h += "<div class=card><details><summary>Camera network (the bridge's own Wi-Fi)</summary><form method=post action=/apsettings>"
        "<label><input type=checkbox name=apon";
@@ -2600,6 +2605,8 @@ static void handleSettings() {
 
 // test print upload -> queue
 uint8_t* upBuf = nullptr; size_t upLen = 0, upCap = 0; bool upFail = false; String upName;
+// Biggest file the test-print box can take: it has to fit in memory whole, with room left to resize it.
+static size_t testPrintMax() { size_t m = spoolLimit(); return m > 2560 * 1024 ? m - 2560 * 1024 : 0; }
 static void handleTestUpload() {
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
@@ -2608,9 +2615,9 @@ static void handleTestUpload() {
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (upFail) return;
     if (upLen + up.currentSize > upCap) {
-      size_t nc = upCap ? upCap * 2 : 256 * 1024;
-      while (nc < upLen + up.currentSize) nc *= 2;
-      uint8_t* nb = (nc <= spoolLimit() + upCap) ? (uint8_t*)bigRealloc(upBuf, nc) : nullptr;
+      size_t nc = upCap + 1024 * 1024;                   // grow 1 MB at a time (doubling ran out of room at ~4 MB)
+      while (nc < upLen + up.currentSize) nc += 1024 * 1024;
+      uint8_t* nb = (nc <= testPrintMax() + upCap) ? (uint8_t*)bigRealloc(upBuf, nc) : nullptr;
       if (!nb) { upFail = true; return; }
       upBuf = nb; upCap = nc;
     }
@@ -2620,7 +2627,7 @@ static void handleTestUpload() {
     if (upFail || !upLen) {
       if (upBuf) free(upBuf);
       upBuf = nullptr; upLen = 0;
-      blog("Upload failed: not enough memory%s", psramFound() ? "" : " (turn on PSRAM)");
+      blog("Test print: that file is too big for the bridge's memory (it takes up to %s here). Send it from the camera instead - that path streams.", fmtSize(testPrintMax()).c_str());
     }
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     if (upBuf) free(upBuf);
