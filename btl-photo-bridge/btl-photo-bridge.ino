@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.7.2   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.7.3   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.7.2"
+#define FW_VERSION    "0.7.3"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -161,6 +161,7 @@ struct ShrinkJob {
   volatile size_t sinkSent = 0;  // bytes of 'out' already handed to the sink
   volatile bool sinkFail = false, sendExited = false;
   SemaphoreHandle_t outReady = nullptr;   // the encoder signals the sender when more bytes exist
+  uint32_t tFirstSend = 0, tEncDone = 0, tSendDone = 0, sendWrites = 0;   // timeline of the stream to the printer
 };
 class CamData;                 // camera data link, defined below (declared here for Arduino's auto-prototypes)
 std::deque<Job>     jobs;
@@ -1504,6 +1505,7 @@ static void shrinkEncTask(void* arg) {
     }
     xSemaphoreGive(j->bandFree[b & 1]);
   }
+  j->tEncDone = millis();
   j->encExited = true;
   if (j->outReady) xSemaphoreGive(j->outReady);
   vTaskDelete(nullptr);
@@ -1517,12 +1519,14 @@ static void shrinkSendTask(void* arg) {
     xSemaphoreTake(j->outReady, pdMS_TO_TICKS(50));
     size_t have = j->outLen;
     bool last = j->encExited;
-    if (have > j->sinkSent && !j->sinkFail && !j->encFail && (last || have - j->sinkSent >= 32 * 1024)) {
+    if (have > j->sinkSent && !j->sinkFail && !j->encFail && (last || have - j->sinkSent >= 16 * 1024)) {
+      if (!j->tFirstSend) j->tFirstSend = millis();
       j->sink(j->sinkCtx, j->out + j->sinkSent, have - j->sinkSent);
-      j->sinkSent = have;
+      j->sinkSent = have; j->sendWrites++;
     }
     if (last && (j->sinkSent >= j->outLen || j->sinkFail || j->encFail)) break;
   }
+  j->tSendDone = millis();
   j->sendExited = true;
   vTaskDelete(nullptr);
 }
@@ -1770,12 +1774,16 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
     return false;
   }
   size_t inBytes = j->hn;
-  char b[200];
+  char b[320];
   bool cropped = j->cw < j->sw || j->ch < j->sh;
+  char st[120] = "";
+  if (j->sink && j->tFirstSend)
+    snprintf(st, sizeof(st), "; printer: first chunk at %.1f s, %lu writes, took the last %.1f s after encoding ended",
+             (j->tFirstSend - t0) / 1000.0, (unsigned long)j->sendWrites, (int32_t)(j->tSendDone - j->tEncDone) / 1000.0);
   snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (camera %.1f s at %u KB/s, decode %.1f s + resize %.1f s, encoded alongside in %.1f s%s)",
            j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(), cropped ? " (edges trimmed to fill the paper)" : "",
            (millis() - t0) / 1000.0, j->tRecv / 1000.0, j->tRecv ? (unsigned)(j->rxBytes / j->tRecv) : 0u, j->tDecOnly / 1000.0,
-           (j->tDec - j->tDecOnly) / 1000.0, j->tEnc / 1000.0, j->sink ? ", streamed to the printer" : "");
+           (j->tDec - j->tDecOnly) / 1000.0, j->tEnc / 1000.0, st);
   j->info = b;
   j->result = 1;
   return true;
