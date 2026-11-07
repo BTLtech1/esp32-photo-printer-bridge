@@ -4,7 +4,7 @@ Print straight from your camera with a ~$10 ESP32-S3 board. Review a shot, press
 
 - **Camera to printer, no phone or computer.** The camera sends the photo over Wi-Fi (Canon's built-in FTP transfer) and the bridge prints it.
 - **USB cable or Wi-Fi to the printer.** Over USB ("IPP over USB") the print starts sooner; over Wi-Fi there's nothing to plug in.
-- **Smart sizing.** Each photo is shrunk to the printer's real resolution (1800 x 1200 on a 4x6 at 300 dpi) and turned upright before it's sent, so big camera files print fast. **Fast** mode (1200 x 800) starts even sooner.
+- **Smart sizing.** Each photo is shrunk to the printer's real resolution (1800 x 1200 on a 4x6 at 300 dpi) and turned upright before it's sent, so big camera files print fast. **Fast** mode (1200 x 800) starts even sooner. Photos that aren't 3:2 are trimmed to fill the paper (or kept whole with white strips, your choice).
 - **Two print modes.** Print every photo you send, or only photos you've rated in camera (for example 3 stars and up).
 - **Print queue.** Send several photos in a row; they wait their turn while the printer is busy.
 - **Status page.** See the printer, the activity log and the exact camera settings at `http://btl-photo.local`.
@@ -28,7 +28,7 @@ Open **https://btltech1.github.io/esp32-photo-printer-bridge** in Chrome or Edge
 
 Right after installing, the page asks for your Wi-Fi (2.4 GHz, the same network as the printer). Once it's connected, **Visit Device** opens the bridge's page, which shows its IP address for the camera. Later you can also use **http://btl-photo.local**.
 
-No Wi-Fi prompt? The bridge also creates a Wi-Fi network called **BTL-Photo-Setup**. Join it and go to `http://192.168.4.1` to enter your Wi-Fi there.
+If the page sits on "Wrapping up" for more than a minute (some USB-serial chips don't let the browser reopen the port straight after flashing), the firmware is already installed: reload the page, click **Install** again, pick the port, and choose **Connect to Wi-Fi**. The bridge also creates a Wi-Fi network called **BTL-Photo-Setup**: join it and go to `http://192.168.4.1` to enter your Wi-Fi there instead.
 
 ## Camera setup (Canon)
 

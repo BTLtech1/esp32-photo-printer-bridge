@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.5.3   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.5.4   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -44,7 +44,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.5.3"
+#define FW_VERSION    "0.5.4"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -71,6 +71,7 @@ SemaphoreHandle_t dataMtx;      // protects queue, log, status strings
 int    printMode = 0;           // 0 = print every JPEG received, 1 = only rated >= minRating
 int    minRating = 3;
 bool   shrinkOn  = true;     // shrink photos to print size before sending
+bool   fillOn    = true;     // crop photos to the paper's 3:2 shape instead of leaving white strips
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1800x1200, 300 dpi), 1 = Fast (1200x800, half-size decode)
 bool   useUsb    = true;     // print over USB when the printer is plugged in
@@ -112,6 +113,8 @@ struct ShrinkJob {
   size_t pos = 0, sockBytes = 0;
   bool err = false;
   int iw = 0, ih = 0, s = 0, sw = 0, sh = 0, tw = 0, th = 0, fw = 0, fh = 0, W = 0, base = 0;
+  bool fill = true;              // fill the paper: crop the edges that don't fit 3:2 (otherwise fit inside, leaving white)
+  int cx0 = 0, cy0 = 0, cw = 0, ch = 0;   // the part of the (scaled) source that goes onto the print
   uint32_t tDecode = 0;
   // Area-weighted (box) resampling: each source pixel covers part of one or two output pixels.
   // ox0/oy0 = first output pixel it lands in, wx0/wy0 = how much of it lands there (out of tw/th).
@@ -1236,7 +1239,7 @@ static size_t shrinkIn(JDEC* jd, uint8_t* buf, size_t nd) {
 
 static void shrinkFinalizeRow(ShrinkJob* j, int oy) {
   uint32_t* row = j->sums + (size_t)(oy % j->W) * j->tw * 3;
-  const uint32_t D = (uint32_t)j->sw * j->sh;          // total weight of every output pixel
+  const uint32_t D = (uint32_t)j->cw * j->ch;          // total weight of every output pixel
   for (int ox = 0; ox < j->tw; ox++) {
     const uint32_t* sm = row + ox * 3;
     int dx, dy;
@@ -1263,10 +1266,12 @@ static void shrinkFinalizeUntil(ShrinkJob* j, int limit) {
 // any output rows that can't receive anything more. Works row by row, in order, so memory access
 // stays sequential (the averaging buffers live in fast internal RAM).
 static void shrinkSourceRow(ShrinkJob* j, int y, const uint8_t* px) {
+  if (j->oy0[y] == 0xFFFF) return;                      // outside the crop
   const int n3 = j->tw * 3;
   uint32_t* h = j->hrow;
   memset(h, 0, (size_t)n3 * sizeof(uint32_t));
   for (int x = 0; x < j->sw; x++, px += 3) {
+    if (j->ox0[x] == 0xFFFF) continue;
     uint32_t wa = j->wx0[x], wb = j->tw - wa;
     uint32_t* a = h + j->ox0[x] * 3;
     a[0] += px[0] * wa; a[1] += px[1] * wa; a[2] += px[2] * wa;
@@ -1340,13 +1345,18 @@ static void shrinkRun(ShrinkJob* j) {
   int L = max(j->iw, j->ih), S = min(j->iw, j->ih);
   int pl = j->fast ? PRINT_LONG * 2 / 3 : PRINT_LONG;      // Fast: 1200x800 (200 dpi on 4x6)
   int ps = j->fast ? PRINT_SHORT * 2 / 3 : PRINT_SHORT;
-  float k = min((float)pl / L, (float)ps / S);
+  // fit: whole photo on the paper (white strips if it isn't 3:2); fill: cover the paper, trim the rest
+  float k = j->fill ? max((float)pl / L, (float)ps / S) : min((float)pl / L, (float)ps / S);
   if (k >= 0.999f) { j->why = "already print size"; return; }
-  int tL = max(1, (int)lroundf(L * k)), tS = max(1, (int)lroundf(S * k));
+  int tL = j->fill ? pl : max(1, (int)lroundf(L * k)), tS = j->fill ? ps : max(1, (int)lroundf(S * k));
   if (j->iw >= j->ih) { j->tw = tL; j->th = tS; } else { j->tw = tS; j->th = tL; }
+  int cwF = min(j->iw, max(j->tw, (int)lroundf(j->tw / k)));   // source area that ends up on the print
+  int chF = min(j->ih, max(j->th, (int)lroundf(j->th / k)));
   j->s = 0;                                             // let the decoder do the first halvings for free
-  while (j->s < 3 && (j->iw >> (j->s + 1)) >= j->tw && (j->ih >> (j->s + 1)) >= j->th) j->s++;
+  while (j->s < 3 && (cwF >> (j->s + 1)) >= j->tw && (chF >> (j->s + 1)) >= j->th) j->s++;
   j->sw = j->iw >> j->s; j->sh = j->ih >> j->s;
+  j->cw = min(j->sw, max(j->tw, cwF >> j->s)); j->ch = min(j->sh, max(j->th, chF >> j->s));
+  j->cx0 = (j->sw - j->cw) / 2; j->cy0 = (j->sh - j->ch) / 2;
   bool rot = j->orient == 6 || j->orient == 8;
   j->fw = rot ? j->th : j->tw; j->fh = rot ? j->tw : j->th;
   j->W = 3;                                             // output rows open at once (row-by-row processing)
@@ -1371,14 +1381,17 @@ static void shrinkRun(ShrinkJob* j) {
     j->why = "not enough memory"; return;
   }
   memset(j->sums, 0, sumBytes);
-  // Source pixel x spans [x*tw, (x+1)*tw) and output pixel o spans [o*sw, (o+1)*sw) on a common scale.
+  // Within the crop, source pixel x spans [x*tw, (x+1)*tw) and output pixel o spans [o*cw, (o+1)*cw)
+  // on a common scale. Source pixels outside the crop are skipped (0xFFFF).
   for (int x = 0; x < j->sw; x++) {
-    uint32_t a = (uint32_t)x * j->tw, o = a / j->sw, edge = (o + 1) * (uint32_t)j->sw;
+    if (x < j->cx0 || x >= j->cx0 + j->cw) { j->ox0[x] = 0xFFFF; j->wx0[x] = 0; continue; }
+    uint32_t a = (uint32_t)(x - j->cx0) * j->tw, o = a / j->cw, edge = (o + 1) * (uint32_t)j->cw;
     j->ox0[x] = o;
     j->wx0[x] = (a + j->tw <= edge) ? j->tw : (edge - a);
   }
   for (int y = 0; y < j->sh; y++) {
-    uint32_t a = (uint32_t)y * j->th, o = a / j->sh, edge = (o + 1) * (uint32_t)j->sh;
+    if (y < j->cy0 || y >= j->cy0 + j->ch) { j->oy0[y] = 0xFFFF; j->wy0[y] = 0; continue; }
+    uint32_t a = (uint32_t)(y - j->cy0) * j->th, o = a / j->ch, edge = (o + 1) * (uint32_t)j->ch;
     j->oy0[y] = o;
     j->wy0[y] = (a + j->th <= edge) ? j->th : (edge - a);
   }
@@ -1422,8 +1435,9 @@ static void shrinkRun(ShrinkJob* j) {
   uint32_t t2 = millis();
   size_t inBytes = j->hn + j->sockBytes;
   char b[160];
-  snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s in %.1f s (receive+decode %.1f s, encode %.1f s)",
-           j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(),
+  bool cropped = j->cw < j->sw || j->ch < j->sh;
+  snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (receive+decode %.1f s, encode %.1f s)",
+           j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(), cropped ? " (edges trimmed to fill the paper)" : "",
            (t2 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
   j->info = b;
   j->result = 1;
@@ -1449,7 +1463,7 @@ static void shrinkBlocking(ShrinkJob* j) {
 static bool shrinkBuffer(uint8_t*& data, size_t& len, String& info) {
   if (!shrinkOn || !psramFound()) { info = "shrinking is off"; return false; }
   ShrinkJob sj;
-  sj.hb = data; sj.hn = len; sj.d = nullptr; sj.eof = true; sj.quality = jpegQ; sj.fast = (speedMode == 1);
+  sj.hb = data; sj.hn = len; sj.d = nullptr; sj.eof = true; sj.quality = jpegQ; sj.fast = (speedMode == 1); sj.fill = fillOn;
   findMeta(data, len, &sj.orient);
   shrinkBlocking(&sj);
   if (sj.result != 1) { info = sj.why; return false; }
@@ -1531,7 +1545,7 @@ static String ftpStor(WiFiClient& d, const String& path) {
   // 3. Shrink to print size (much faster to print), then queue it for the printer.
   if (shrinkOn && psramFound()) {
     ShrinkJob sj;
-    sj.hb = hb; sj.hn = hn; sj.d = &d; sj.eof = eof; sj.orient = orient; sj.quality = jpegQ; sj.fast = (speedMode == 1);
+    sj.hb = hb; sj.hn = hn; sj.d = &d; sj.eof = eof; sj.orient = orient; sj.quality = jpegQ; sj.fast = (speedMode == 1); sj.fill = fillOn;
     shrinkBlocking(&sj);
     if (sj.result == 1) {
       free(hb);
@@ -1757,6 +1771,9 @@ static void handleRoot() {
        "<label><input type=checkbox name=shrink";
   if (shrinkOn) h += " checked";
   h += "> Shrink photos to print size first <span class=mut>(prints much sooner; still the printer's full 300 dpi)</span></label>"
+       "<label><input type=checkbox name=fill";
+  if (fillOn) h += " checked";
+  h += "> Fill the paper <span class=mut>(photos that aren't 3:2 get their edges trimmed instead of white strips)</span></label>"
        "<label>Quality sent to the printer <select name=q>";
   const int qs[3] = { 75, 85, 95 };
   const char* qn[3] = { "Fast", "Balanced", "Best" };
@@ -1858,6 +1875,7 @@ static void handleSettings() {
   if (server.arg("fuser").length()) ftpUser = server.arg("fuser");
   if (server.arg("fpass").length()) ftpPass = server.arg("fpass");
   shrinkOn = server.hasArg("shrink");
+  fillOn = server.hasArg("fill"); prefs.putBool("fill", fillOn);
   useUsb = server.hasArg("usb");
   speedMode = server.arg("speed").toInt() == 1 ? 1 : 0;
   prefs.putBool("usb", useUsb); prefs.putInt("speed", speedMode);
@@ -2034,6 +2052,7 @@ void setup() {
   printMode = prefs.getInt("mode", 0);
   minRating = prefs.getInt("minr", 3);
   shrinkOn = prefs.getBool("shrink", true);
+  fillOn = prefs.getBool("fill", true);
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
   speedMode = prefs.getInt("speed", 0);

@@ -57,8 +57,9 @@
     <h2>Step 3: Connect it to your Wi-Fi</h2>
     <p>Right after installing, this page asks for your Wi-Fi. Pick your network, type the password and click <b>Connect</b>. Use the same <b>2.4 GHz</b> network as your printer.</p>
     <p>When it says it's connected, click <b>Visit Device</b> to open the bridge's page. It shows the bridge's IP address (you'll type it into the camera), the printer and the activity log. Later you can also open <b>http://btl-photo.local</b>.</p>
+    <p class="muted"><b>Stuck on "Wrapping up"?</b> The firmware is already installed; the browser just couldn't reopen the port. Reload this page, click Install again, pick the port, and choose <b>Connect to Wi-Fi</b>.</p>
     <p class="muted"><b>Already installed?</b> Click Install, connect, and choose <b>Change Wi-Fi</b> (or <b>Visit Device</b> to find its address).</p>
-    <p class="muted"><b>No Wi-Fi prompt?</b> The bridge makes its own Wi-Fi network called <b>BTL-Photo-Setup</b>. Join it from your phone and go to <code>http://192.168.4.1</code> to enter your Wi-Fi there.</p>
+    <p class="muted"><b>No Wi-Fi prompt at all?</b> The bridge makes its own Wi-Fi network called <b>BTL-Photo-Setup</b>. Join it from your phone and go to <code>http://192.168.4.1</code> to enter your Wi-Fi there.</p>
   </div>
 
   <div class="card">
@@ -88,7 +89,7 @@
   </div>
 
   <details class="card"><summary>Print modes and settings</summary>
-    <p><b>Print every photo the camera sends</b>, or <b>only photos rated</b> 1&ndash;5 stars or more (rate in the camera, then send a batch). Photos are shrunk to the printer's resolution and turned upright before printing; <b>Fast</b> mode sends a lighter file that starts printing sooner.</p>
+    <p><b>Print every photo the camera sends</b>, or <b>only photos rated</b> 1&ndash;5 stars or more (rate in the camera, then send a batch). Photos are shrunk to the printer's resolution and turned upright before printing; <b>Fast</b> mode sends a lighter file that starts printing sooner. Photos that aren't 3:2 are trimmed to fill the paper, unless you turn <b>Fill the paper</b> off.</p>
   </details>
 
   <p class="muted">Source code and full guide: <a href="https://github.com/BTLtech1/esp32-photo-printer-bridge">github.com/BTLtech1/esp32-photo-printer-bridge</a></p>
