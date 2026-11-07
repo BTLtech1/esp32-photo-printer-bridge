@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.6.3   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.6.4   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.6.3"
+#define FW_VERSION    "0.6.4"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -1284,14 +1284,20 @@ class CamData : public Client {
   int connect(IPAddress, uint16_t) override { return 0; }
   int connect(const char*, uint16_t) override { return 0; }
 
+  // Closes a connection politely. lwIP sends a reset instead of a close when the receive window
+  // isn't at its default (it takes that as "the application didn't read everything"), so put the
+  // default back first.
+  static void closePcb(tcp_pcb* p) {
+    tcp_arg(p, nullptr); tcp_recv(p, nullptr); tcp_err(p, nullptr);
+    p->rcv_wnd = TCP_WND_MAX(p);
+    p->rcv_ann_wnd = TCP_WND_MAX(p);
+    if (tcp_close(p) != ERR_OK) tcp_abort(p);
+  }
+
   // Closes the data connection and empties the buffer.
   void stop() override {
     LOCK_TCPIP_CORE();
-    if (pcb) {
-      tcp_arg(pcb, nullptr); tcp_recv(pcb, nullptr); tcp_err(pcb, nullptr);
-      if (tcp_close(pcb) != ERR_OK) tcp_abort(pcb);
-      pcb = nullptr;
-    }
+    if (pcb) { closePcb(pcb); pcb = nullptr; }
     UNLOCK_TCPIP_CORE();
     accepted = false; closed = false; clamped = false;
     if (ring) xStreamBufferReset(ring);
@@ -1348,9 +1354,8 @@ class CamData : public Client {
     if (!pb) {                                            // the camera closed its side: the file is complete
       self->closed = true;
       if (self->inBytes < 1024) blog("Camera data link: camera closed after %lu bytes", (unsigned long)self->inBytes);
-      tcp_arg(p, nullptr); tcp_recv(p, nullptr); tcp_err(p, nullptr);
       self->pcb = nullptr;
-      if (tcp_close(p) != ERR_OK) tcp_abort(p);
+      closePcb(p);
       return ERR_OK;
     }
     if (err != ERR_OK) { pbuf_free(pb); return ERR_OK; }
