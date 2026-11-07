@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.8.2   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.8.3   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -48,7 +48,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.8.2"
+#define FW_VERSION    "0.8.3"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -75,7 +75,7 @@ int    printMode = 0;           // 0 = print every JPEG received, 1 = only rated
 int    minRating = 3;
 bool   shrinkOn  = true;     // shrink photos to print size before sending
 bool   fillOn    = true;     // crop photos to the paper's 3:2 shape instead of leaving white strips
-bool   scaleFill = true;     // ask the printer to scale the photo to fill the paper (IPP print-scaling=fill)
+bool   scaleFill = true;     // borderless: ask for the paper with zero margins (media-col)
 bool   dryRun    = false;    // test mode: process photos but don't print them
 volatile bool saveScaleFill = false;
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
@@ -312,6 +312,23 @@ static void ippHeader(std::vector<uint8_t>& b, uint16_t op) {
   putAttr(b, 0x45, "printer-uri", printerUri());
 }
 
+// Collection members (IPP "memberAttrName" + value, no attribute name)
+static void putMember(std::vector<uint8_t>& b, const char* member) {
+  put8(b, 0x4A); put16(b, 0); put16(b, strlen(member)); for (const char* c = member; *c; c++) put8(b, (uint8_t)*c);
+}
+static void putMemberInt(std::vector<uint8_t>& b, const char* member, int32_t v) {
+  putMember(b, member); put8(b, 0x21); put16(b, 0); put16(b, 4); put32(b, (uint32_t)v);
+}
+static void putMemberKeyword(std::vector<uint8_t>& b, const char* member, const char* v) {
+  putMember(b, member); put8(b, 0x44); put16(b, 0); put16(b, strlen(v)); for (const char* c = v; *c; c++) put8(b, (uint8_t)*c);
+}
+static void beginCollection(std::vector<uint8_t>& b, const char* name) {   // name may be "" for a nested one
+  put8(b, 0x34); put16(b, strlen(name)); for (const char* c = name; *c; c++) put8(b, (uint8_t)*c); put16(b, 0);
+}
+static void endCollection(std::vector<uint8_t>& b) { put8(b, 0x37); put16(b, 0); put16(b, 0); }
+
+// The SELPHY's default paper setting is the postcard WITH margins (3.7 mm top/bottom, 2.5 mm sides);
+// borderless is the same paper asked for with all margins at zero, as a "media-col" collection.
 static void buildPrintJob(std::vector<uint8_t>& h, const String& name, bool withScaling = true) {
   ippHeader(h, 0x0002);                   // Print-Job
   putAttr(h, 0x42, "requesting-user-name", "btl-photo");
@@ -319,7 +336,19 @@ static void buildPrintJob(std::vector<uint8_t>& h, const String& name, bool with
   putAttr(h, 0x49, "document-format", "image/jpeg");
   if (withScaling && scaleFill) {
     put8(h, 0x02);                        // job attributes group
-    putAttr(h, 0x44, "print-scaling", "fill");   // cover the whole sheet (borderless), trim the overhang
+    beginCollection(h, "media-col");
+    putMember(h, "media-size");
+    beginCollection(h, "");
+    putMemberInt(h, "x-dimension", 10000);   // 100 x 148 mm, in hundredths of a millimetre
+    putMemberInt(h, "y-dimension", 14800);
+    endCollection(h);
+    putMemberInt(h, "media-top-margin", 0);
+    putMemberInt(h, "media-bottom-margin", 0);
+    putMemberInt(h, "media-left-margin", 0);
+    putMemberInt(h, "media-right-margin", 0);
+    putMemberKeyword(h, "media-type", "photographic");
+    putMemberKeyword(h, "media-source", "photo");
+    endCollection(h);
   }
   put8(h, 0x03);
 }
@@ -1016,7 +1045,7 @@ static uint16_t sendBufferJob(const Job& j, bool withScaling = true) {
   if (code != 200) return 0xFFFF;
   uint16_t st = parseIpp(body, nullptr);
   if (st >= 0x0400 && st < 0x0500 && withScaling && scaleFill) {   // printer didn't like print-scaling: send it plain
-    blog("Printer refused print-scaling=fill (%s); turning that option off", ippStatusName(st).c_str());
+    blog("Printer refused the borderless paper setting (%s); turning that option off", ippStatusName(st).c_str());
     scaleFill = false; saveScaleFill = true;            // saved from loop(): this task's stack lives in external RAM
     return sendBufferJob(j, false);
   }
@@ -2391,7 +2420,7 @@ static void handleRoot() {
   h += "> Fill the paper <span class=mut>(photos that aren't 3:2 get their edges trimmed instead of white strips)</span></label>"
        "<label><input type=checkbox name=pscale";
   if (scaleFill) h += " checked";
-  h += "> Borderless <span class=mut>(asks the printer to stretch the photo over the whole sheet; turn off if prints come out wrong)</span></label>"
+  h += "> Borderless <span class=mut>(asks for the postcard paper with zero margins; off = the printer's own margins, about 3.7 mm top and bottom)</span></label>"
        "<label><input type=checkbox name=dry";
   if (dryRun) h += " checked";
   h += "> <b>Test mode</b>: process photos but don't print them <span class=mut>(timing shows in the log, no paper used)</span></label>"
