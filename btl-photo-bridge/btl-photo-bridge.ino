@@ -82,7 +82,10 @@ int    cassCap   = 54;       // prints per ink cassette (RP-108 = 2 x 54; KP-108
 volatile int cassUsed = 0;   // prints since the last "New cassette"
 volatile bool saveCass = false;
 // The SELPHY doesn't report how much ink is left, so the bridge counts its own prints.
-#define countPrint() do { if (!dryRun) { cassUsed++; saveCass = true; } } while (0)
+int    paperCap  = 18;       // sheets loaded in the paper tray (the CP1500 tray holds 18)
+volatile int paperUsed = 0;
+#define countPrint() do { if (!dryRun) { cassUsed++; paperUsed++; saveCass = true; } } while (0)
+#define paperLeft() (paperCap - paperUsed < 0 ? 0 : paperCap - paperUsed)
 #define printsLeft() (cassCap - cassUsed < 0 ? 0 : cassCap - cassUsed)
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1872x1248, the printer's native size), 1 = Fast (two thirds of that)
@@ -2447,6 +2450,10 @@ static void handleRoot() {
        "<form method=post action=/cassette style='display:inline;margin-left:8px'>"
        "of <input name=cap type=number min=1 max=200 style='width:4.5em' value=" + String(cassCap) + "> "
        "<button name=new value=1 style='padding:4px 10px'>New cassette</button> <button style='padding:4px 10px'>Save size</button></form></td></tr>"
+       "<tr><td>Paper in tray</td><td><span id=pp>&hellip;</span>"
+       "<form method=post action=/paper style='display:inline;margin-left:8px'>"
+       "loaded <input name=cap type=number min=1 max=18 style='width:4.5em' value=" + String(paperCap) + "> "
+       "<button style='padding:4px 10px'>Paper loaded</button></form></td></tr>"
        "<tr><td>Mode</td><td>";
   if (printMode == 1) h += "Only photos rated " + String(minRating) + "&#9733; or more";
   else h += "Every photo the camera sends";
@@ -2545,7 +2552,7 @@ static void handleRoot() {
 
   h += "<script>async function u(){try{const s=await(await fetch('/status')).json();"
        "pr.textContent=s.printer;ps.textContent=s.pstate+(s.reasons&&s.reasons!='none'?' ('+s.reasons+')':'');"
-       "pu.textContent=s.usb;pq.textContent=s.queue;pl.textContent=s.left+' prints left';pl.style.color=s.left<=5?'#f5b400':'';log.textContent=s.log.join('\\n')||'Nothing yet.';}catch(e){}}"
+       "pu.textContent=s.usb;pq.textContent=s.queue;pl.textContent=s.left+' prints left';pl.style.color=s.left<=5?'#f5b400':'';pp.textContent=s.paper+' sheets left';pp.style.color=s.paper<=3?'#f5b400':'';log.textContent=s.log.join('\\n')||'Nothing yet.';}catch(e){}}"
        "u();setInterval(u,3000);</script></body></html>";
   server.send(200, "text/html", h);
 }
@@ -2639,11 +2646,19 @@ static void handleStatus() {
   String us = usbState;
   if (uReady && !useUsb) us += " (turned off in settings, using Wi-Fi)";
   j += "\"printer\":\"" + jsonEsc(pn) + "\",\"usb\":\"" + jsonEsc(us) + "\",\"pstate\":\"" + pst + "\",\"reasons\":\"" + jsonEsc(printerReasons) +
-       "\",\"queue\":" + String(jobs.size()) + ",\"left\":" + String(printsLeft()) + ",\"cap\":" + String(cassCap) + ",\"log\":[";
+       "\",\"queue\":" + String(jobs.size()) + ",\"left\":" + String(printsLeft()) + ",\"cap\":" + String(cassCap) + ",\"paper\":" + String(paperLeft()) + ",\"log\":[";
   for (size_t i = 0; i < logLines.size(); i++) { if (i) j += ","; j += "\"" + jsonEsc(logLines[i]) + "\""; }
   xSemaphoreGive(dataMtx);
   j += "]}";
   server.send(200, "application/json", j);
+}
+
+static void handlePaper() {
+  int c = server.arg("cap").toInt();
+  if (c >= 1 && c <= 18) { paperCap = c; prefs.putInt("pcap", paperCap); }
+  paperUsed = 0; prefs.putInt("pused", 0);
+  blog("Paper loaded: %d sheets", paperCap);
+  redirectHome();
 }
 
 static void handleCassette() {
@@ -2848,7 +2863,7 @@ void setup() {
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
   speedMode = prefs.getInt("speed", 0);
-  cassCap = prefs.getInt("ccap", 54); cassUsed = prefs.getInt("cused", 0);
+  cassCap = prefs.getInt("ccap", 54); cassUsed = prefs.getInt("cused", 0); paperCap = prefs.getInt("pcap", 18); paperUsed = prefs.getInt("pused", 0);
   colWarm = prefs.getInt("cwarm", 0); colCon = prefs.getInt("ccon", 0); colSat = prefs.getInt("csat", 0);
   buildColor();
   ftpUser = prefs.getString("fuser", "btl");
@@ -2886,6 +2901,7 @@ void setup() {
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/settings", HTTP_POST, handleSettings);
   server.on("/cassette", HTTP_POST, handleCassette);
+  server.on("/paper", HTTP_POST, handlePaper);
   server.on("/rediscover", HTTP_POST, []() { printerFound = false; redirectHome(); });
   server.on("/usbcheck", HTTP_POST, handleUsbCheck);
   server.on("/usbdiag", HTTP_GET, []() { server.send(200, "text/plain", usbDiagText()); });
@@ -2918,7 +2934,9 @@ void loop() {
   serviceImprov();
   server.handleClient();
   if (saveScaleFill) { saveScaleFill = false; prefs.putBool("pscale", scaleFill); }
-  if (saveCass) { saveCass = false; prefs.putInt("cused", cassUsed);
+  if (saveCass) { saveCass = false; prefs.putInt("cused", cassUsed); prefs.putInt("pused", paperUsed);
+    if (paperLeft() == 3) blog("Paper tray: 3 sheets left");
+    if (paperLeft() == 0) blog("Paper tray: count says it's empty - refill and press Paper loaded");
     if (printsLeft() == 5) blog("Ink cassette: 5 prints left - have a new pack ready");
     if (printsLeft() == 0) blog("Ink cassette: count says it's used up - put in a new pack and press New cassette"); }
   static bool wasUp = false;                      // home Wi-Fi can come and go; note it in the log
