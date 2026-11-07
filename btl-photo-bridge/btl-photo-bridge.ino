@@ -78,12 +78,11 @@ bool   fillOn    = true;     // crop photos to the paper's 3:2 shape instead of 
 bool   scaleFill = true;     // borderless: ask for the paper with zero margins (media-col)
 bool   dryRun    = false;    // test mode: process photos but don't print them
 volatile bool saveScaleFill = false;
-int    cassCap   = 36;       // prints per ink cassette (set on the page; depends on the pack)
+int    cassCap   = 54;       // prints per ink cassette (RP-108 = 2 x 54; KP-108IN = 3 x 36)
 volatile int cassUsed = 0;   // prints since the last "New cassette"
 volatile bool saveCass = false;
 // The SELPHY doesn't report how much ink is left, so the bridge counts its own prints.
 #define countPrint() do { if (!dryRun) { cassUsed++; saveCass = true; } } while (0)
-// if (!dryRun) { cassUsed++; saveCass = true; } }
 #define printsLeft() (cassCap - cassUsed < 0 ? 0 : cassCap - cassUsed)
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1872x1248, the printer's native size), 1 = Fast (two thirds of that)
@@ -2849,7 +2848,7 @@ void setup() {
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
   speedMode = prefs.getInt("speed", 0);
-  cassCap = prefs.getInt("ccap", 36); cassUsed = prefs.getInt("cused", 0);
+  cassCap = prefs.getInt("ccap", 54); cassUsed = prefs.getInt("cused", 0);
   colWarm = prefs.getInt("cwarm", 0); colCon = prefs.getInt("ccon", 0); colSat = prefs.getInt("csat", 0);
   buildColor();
   ftpUser = prefs.getString("fuser", "btl");
