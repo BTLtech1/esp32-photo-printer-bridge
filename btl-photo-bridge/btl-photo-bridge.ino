@@ -1,5 +1,5 @@
 /*
-  BTL Photo Printer Bridge  v0.5.5   (ESP32-S3)
+  BTL Photo Printer Bridge  v0.5.6   (ESP32-S3)
   Camera  --Wi-Fi/FTP-->  ESP32-S3  --USB cable or Wi-Fi (IPP)-->  photo printer (tested: Canon SELPHY CP1500)
 
   - Runs a small FTP server. Set the camera to "Transfer with SET" and press SET in playback to print.
@@ -44,7 +44,7 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 
-#define FW_VERSION    "0.5.5"
+#define FW_VERSION    "0.5.6"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -72,6 +72,7 @@ int    printMode = 0;           // 0 = print every JPEG received, 1 = only rated
 int    minRating = 3;
 bool   shrinkOn  = true;     // shrink photos to print size before sending
 bool   fillOn    = true;     // crop photos to the paper's 3:2 shape instead of leaving white strips
+bool   scaleFill = true;     // ask the printer to scale the photo to fill the paper (IPP print-scaling=fill)
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1800x1200, 300 dpi), 1 = Fast (1200x800, half-size decode)
 bool   useUsb    = true;     // print over USB when the printer is plugged in
@@ -114,6 +115,14 @@ struct ShrinkJob {
   bool err = false;
   int iw = 0, ih = 0, s = 0, sw = 0, sh = 0, tw = 0, th = 0, fw = 0, fh = 0, W = 0, base = 0;
   bool fill = true;              // fill the paper: crop the edges that don't fit 3:2 (otherwise fit inside, leaving white)
+  // Receive-ahead: a helper task pulls the camera's data into a big buffer while the decoder works,
+  // so the camera never waits for the decoder (the Wi-Fi stack's own buffer is only a few KB).
+  StreamBufferHandle_t rx = nullptr;
+  StaticStreamBuffer_t* rxCtl = nullptr;
+  uint8_t* rxMem = nullptr;
+  volatile bool rxDone = false, rxErr = false, rxStop = false, rxExited = false;
+  size_t rxBytes = 0;
+  uint32_t rxFirstMs = 0, rxLastMs = 0, waitMs = 0;
   int cx0 = 0, cy0 = 0, cw = 0, ch = 0;   // the part of the (scaled) source that goes onto the print
   uint32_t tDecode = 0;
   // Area-weighted (box) resampling: each source pixel covers part of one or two output pixels.
@@ -277,11 +286,15 @@ static void ippHeader(std::vector<uint8_t>& b, uint16_t op) {
   putAttr(b, 0x45, "printer-uri", printerUri());
 }
 
-static void buildPrintJob(std::vector<uint8_t>& h, const String& name) {
+static void buildPrintJob(std::vector<uint8_t>& h, const String& name, bool withScaling = true) {
   ippHeader(h, 0x0002);                   // Print-Job
   putAttr(h, 0x42, "requesting-user-name", "btl-photo");
   putAttr(h, 0x42, "job-name", name.length() ? name : String("photo.jpg"));
   putAttr(h, 0x49, "document-format", "image/jpeg");
+  if (withScaling && scaleFill) {
+    put8(h, 0x02);                        // job attributes group
+    putAttr(h, 0x44, "print-scaling", "fill");   // cover the whole sheet (borderless), trim the overhang
+  }
   put8(h, 0x03);
 }
 
@@ -333,6 +346,8 @@ static uint16_t parseIpp(const std::vector<uint8_t>& d, String* out) {
     String s;
     if ((tag == 0x21 || tag == 0x23) && vl == 4) s = String((int32_t)rd32(v));
     else if (tag == 0x22 && vl == 1) s = v[0] ? "true" : "false";
+    else if (tag == 0x32 && vl == 9) s = String((int32_t)rd32(v)) + "x" + String((int32_t)rd32(v + 4)) + (v[8] == 3 ? " dpi" : " dpcm");
+    else if (tag == 0x33 && vl == 8) s = String((int32_t)rd32(v)) + "-" + String((int32_t)rd32(v + 4));
     else if (tag >= 0x40) { uint16_t m = vl > 160 ? 160 : vl; for (uint16_t i = 0; i < m; i++) s += (char)v[i]; }
     else continue;
     if (name.length()) *out += "\n" + name + " = " + s;
@@ -940,14 +955,14 @@ static bool printerReady() {
   return queryPrinterStatus() == 3;                                     // 3 = idle
 }
 
-static uint16_t sendBufferJob(const Job& j) {
+static uint16_t sendBufferJob(const Job& j, bool withScaling = true) {
   WiFiClient w;
   Client* c = printerConnect(w, 5000);
   if (!c) return 0xFFFE;
   Client& pc = *c;
   uint32_t t0 = millis();
   std::vector<uint8_t> h;
-  buildPrintJob(h, j.name);
+  buildPrintJob(h, j.name, withScaling);
   sendPostHeaders(pc, false, h.size() + j.len);
   writeAll(pc, h.data(), h.size());
   writeAll(pc, j.data, j.len);
@@ -958,6 +973,11 @@ static uint16_t sendBufferJob(const Job& j) {
   lastSendMs = t1 - t0; lastAnswerMs = millis() - t1;
   if (code != 200) return 0xFFFF;
   uint16_t st = parseIpp(body, nullptr);
+  if (st >= 0x0400 && st < 0x0500 && withScaling && scaleFill) {   // printer didn't like print-scaling: send it plain
+    blog("Printer refused print-scaling=fill (%s); turning that option off", ippStatusName(st).c_str());
+    scaleFill = false; prefs.putBool("pscale", false);
+    return sendBufferJob(j, false);
+  }
   if (st < 0x0100) lastSubmitMs = millis();
   return st;
 }
@@ -1216,6 +1236,52 @@ static size_t drain(WiFiClient& d) {
 #define PRINT_SHORT 1200
 
 
+static void shrinkRxTask(void* arg) {
+  ShrinkJob* j = (ShrinkJob*)arg;
+  uint8_t* tmp = (uint8_t*)malloc(16384);
+  while (tmp && !j->rxStop) {
+    int n = readSome(*j->d, tmp, 16384, 30000);
+    if (n <= 0) { if (n < 0) j->rxErr = true; break; }
+    if (!j->rxFirstMs) j->rxFirstMs = millis();
+    size_t off = 0;
+    while (off < (size_t)n && !j->rxStop) off += xStreamBufferSend(j->rx, tmp + off, n - off, pdMS_TO_TICKS(100));
+    j->rxBytes += n; j->rxLastMs = millis();
+  }
+  free(tmp);
+  j->rxDone = true;
+  j->rxExited = true;
+  vTaskDelete(nullptr);
+}
+
+// Starts the receive-ahead helper (only for photos streaming in from the camera).
+static void shrinkRxStart(ShrinkJob* j) {
+  if (!j->d || j->eof) return;
+  size_t avail = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  size_t cap = avail > 1536 * 1024 ? 1024 * 1024 : avail > 640 * 1024 ? avail - 512 * 1024 : 0;
+  if (cap < 64 * 1024) return;                            // not enough room: read straight from the socket
+  j->rxMem = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  j->rxCtl = (StaticStreamBuffer_t*)malloc(sizeof(StaticStreamBuffer_t));
+  if (!j->rxMem || !j->rxCtl) { free(j->rxMem); free(j->rxCtl); j->rxMem = nullptr; j->rxCtl = nullptr; return; }
+  j->rx = xStreamBufferCreateStatic(cap, 1, j->rxMem, j->rxCtl);
+  if (!j->rx || xTaskCreatePinnedToCore(shrinkRxTask, "shrinkrx", 4096, j, 2, nullptr, 0) != pdPASS) {
+    if (j->rx) vStreamBufferDelete(j->rx);
+    free(j->rxMem); free(j->rxCtl); j->rx = nullptr; j->rxMem = nullptr; j->rxCtl = nullptr;
+  }
+}
+
+// Waits for the helper to finish (stop = true: tell it to quit now) and frees the buffer.
+static void shrinkRxFinish(ShrinkJob* j, bool stop) {
+  if (!j->rx) return;
+  if (stop) j->rxStop = true;
+  uint8_t sink[512];
+  while (!j->rxExited) {                                  // keep emptying the buffer so the helper never gets stuck on a full one
+    if (xStreamBufferReceive(j->rx, sink, sizeof(sink), pdMS_TO_TICKS(2)) == 0) delay(1);
+  }
+  vStreamBufferDelete(j->rx);
+  free(j->rxMem); free(j->rxCtl);
+  j->rx = nullptr; j->rxMem = nullptr; j->rxCtl = nullptr;
+}
+
 static size_t shrinkIn(JDEC* jd, uint8_t* buf, size_t nd) {
   ShrinkJob* j = (ShrinkJob*)jd->device;
   size_t got = 0;
@@ -1230,7 +1296,19 @@ static size_t shrinkIn(JDEC* jd, uint8_t* buf, size_t nd) {
     if (j->eof || !j->d) break;
     uint8_t* dst = buf ? buf + got : tmp;
     size_t want = buf ? nd - got : min(nd - got, sizeof(tmp));
-    int n = readSome(*j->d, dst, want, 30000);
+    int n;
+    if (j->rx) {                                          // from the receive-ahead buffer
+      uint32_t w0 = millis();
+      while (true) {
+        n = xStreamBufferReceive(j->rx, dst, want, pdMS_TO_TICKS(20));
+        if (n > 0) break;
+        if (j->rxDone && xStreamBufferIsEmpty(j->rx)) { n = j->rxErr ? -1 : 0; break; }
+        if (millis() - w0 > 30000) { n = -1; break; }
+      }
+      j->waitMs += millis() - w0;
+    } else {
+      n = readSome(*j->d, dst, want, 30000);
+    }
     if (n <= 0) { if (n < 0) j->err = true; j->eof = true; break; }
     got += n; j->sockBytes += n;
   }
@@ -1396,9 +1474,11 @@ static void shrinkRun(ShrinkJob* j) {
     j->wy0[y] = (a + j->th <= edge) ? j->th : (edge - a);
   }
 
+  shrinkRxStart(j);
   JDEC jd;
   JRESULT rc = jd_prepare(&jd, shrinkIn, j->pool, POOL, j);
   if (rc != JDR_OK || jd.width != j->iw || jd.height != j->ih) {
+    shrinkRxFinish(j, true);
     shrinkFreeWork(j); free(j->frame); j->frame = nullptr;
     j->why = "decoder could not read it (" + String((int)rc) + ")";
     j->result = j->sockBytes ? -1 : 0;
@@ -1407,12 +1487,14 @@ static void shrinkRun(ShrinkJob* j) {
   int mcuRows = (jd.msy * 8) >> j->s;                     // block row height: 8 or 16 rows, scaled
   if (mcuRows < 1) mcuRows = 1;
   if (mcuRows > j->bandH) {                               // never: blocks are at most 16 rows tall
+    shrinkRxFinish(j, true);
     shrinkFreeWork(j); free(j->frame); j->frame = nullptr;
     j->why = "unexpected block size"; j->result = -1; return;
   }
   j->bandH = mcuRows;
   rc = jd_decomp(&jd, shrinkOut, j->s);
   if (rc != JDR_OK) {
+    shrinkRxFinish(j, true);
     shrinkFreeWork(j); free(j->frame); j->frame = nullptr;
     j->why = j->err ? String("camera stopped sending") : ("decode error " + String((int)rc));
     j->result = -1;
@@ -1421,8 +1503,11 @@ static void shrinkRun(ShrinkJob* j) {
   shrinkFlushBand(j);
   shrinkFinalizeUntil(j, j->th);
   shrinkFreeWork(j);
-  if (j->d && !j->eof) { j->sockBytes += drain(*j->d); j->eof = true; }   // e.g. Canon's embedded preview
   uint32_t t1 = millis();
+  if (j->rx) {                                            // let the helper take in the rest (e.g. Canon's embedded preview)
+    shrinkRxFinish(j, false);
+    j->sockBytes = j->rxBytes; j->eof = true;
+  } else if (j->d && !j->eof) { j->sockBytes += drain(*j->d); j->eof = true; }
 
   bool ok = fmt2jpg_cb(j->frame, frameBytes, j->fw, j->fh, PIXFORMAT_RGB888, j->quality, shrinkJpgOut, j);
   free(j->frame); j->frame = nullptr;
@@ -1434,11 +1519,16 @@ static void shrinkRun(ShrinkJob* j) {
   }
   uint32_t t2 = millis();
   size_t inBytes = j->hn + j->sockBytes;
-  char b[160];
+  char b[200];
   bool cropped = j->cw < j->sw || j->ch < j->sh;
-  snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (receive+decode %.1f s, encode %.1f s)",
-           j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(), cropped ? " (edges trimmed to fill the paper)" : "",
-           (t2 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
+  if (j->rxBytes)
+    snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (camera sent %s in %.1f s, decode+resize %.1f s of which %.1f s waiting for the camera, encode %.1f s)",
+             j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(), cropped ? " (edges trimmed to fill the paper)" : "",
+             (t2 - t0) / 1000.0, fmtSize(j->rxBytes).c_str(), (j->rxLastMs - j->rxFirstMs) / 1000.0, (t1 - t0) / 1000.0, j->waitMs / 1000.0, (t2 - t1) / 1000.0);
+  else
+    snprintf(b, sizeof(b), "shrunk %dx%d %s -> %dx%d %s%s in %.1f s (receive+decode %.1f s, encode %.1f s)",
+             j->iw, j->ih, fmtSize(inBytes).c_str(), j->fw, j->fh, fmtSize(j->outLen).c_str(), cropped ? " (edges trimmed to fill the paper)" : "",
+             (t2 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
   j->info = b;
   j->result = 1;
 }
@@ -1755,7 +1845,7 @@ static void handleRoot() {
        "<form method=post action=/rediscover><button>Search for printer again</button></form>"
        "<form method=post action=/usbcheck><button>Check the printer over USB</button></form>"
        "<form method=post action=/usbreset><button>Restart the USB port</button></form>"
-       "<div class=mut style='margin-top:6px'><a style='color:inherit' href=/usbdiag>USB diagnostics</a></div></div>";
+       "<div class=mut style='margin-top:6px'><a style='color:inherit' href=/usbdiag>USB diagnostics</a> &middot; <a style='color:inherit' href=/printerinfo>Printer details</a></div></div>";
 
   h += "<div class=card><h2>Activity</h2><pre id=log>&hellip;</pre></div>";
 
@@ -1774,6 +1864,9 @@ static void handleRoot() {
        "<label><input type=checkbox name=fill";
   if (fillOn) h += " checked";
   h += "> Fill the paper <span class=mut>(photos that aren't 3:2 get their edges trimmed instead of white strips)</span></label>"
+       "<label><input type=checkbox name=pscale";
+  if (scaleFill) h += " checked";
+  h += "> Borderless <span class=mut>(asks the printer to stretch the photo over the whole sheet; turn off if prints come out wrong)</span></label>"
        "<label>Quality sent to the printer <select name=q>";
   const int qs[3] = { 75, 85, 95 };
   const char* qn[3] = { "Fast", "Balanced", "Best" };
@@ -1852,6 +1945,39 @@ static void handleUsbCheck() {
   redirectHome();
 }
 
+// Asks the printer what it can do (paper, scaling, resolution) and shows the answer as text.
+static void handlePrinterInfo() {
+  if (!printerAvailable()) { server.send(200, "text/plain", "No printer yet."); return; }
+  if (xSemaphoreTake(printerMtx, pdMS_TO_TICKS(8000)) != pdTRUE) { server.send(200, "text/plain", "Printer busy, try again in a few seconds."); return; }
+  WiFiClient w;
+  Client* c = printerConnect(w, 5000);
+  String o = "BTL Photo Printer Bridge v" FW_VERSION " - printer details (" + String(curUsb ? "USB cable" : "Wi-Fi") + ")\n";
+  if (!c) o += "Couldn't reach the printer.\n";
+  else {
+    std::vector<uint8_t> req;
+    ippHeader(req, 0x000B);
+    putAttr(req, 0x44, "requested-attributes", "printer-make-and-model");
+    const char* want[] = { "printer-state", "printer-state-reasons", "ipp-versions-supported", "document-format-supported",
+      "media-default", "media-ready", "media-supported", "media-type-supported", "media-source-supported",
+      "print-scaling-default", "print-scaling-supported", "printer-resolution-default", "printer-resolution-supported",
+      "print-quality-default", "print-quality-supported", "print-color-mode-supported", "media-bottom-margin-supported",
+      "media-top-margin-supported", "media-left-margin-supported", "media-right-margin-supported", "job-creation-attributes-supported" };
+    for (auto a : want) putAttrMore(req, 0x44, a);
+    put8(req, 0x03);
+    uint32_t t0 = millis();
+    sendPostHeaders(*c, false, req.size());
+    writeAll(*c, req.data(), req.size());
+    std::vector<uint8_t> body;
+    int code = readHttpResponse(*c, body);
+    c->stop();
+    String txt;
+    uint16_t st = code == 200 ? parseIpp(body, &txt) : 0xFFFF;
+    o += "HTTP " + String(code) + ", IPP " + ippStatusName(st) + ", " + String(millis() - t0) + " ms, " + String(body.size()) + " bytes\n" + txt + "\n";
+  }
+  xSemaphoreGive(printerMtx);
+  server.send(200, "text/plain", o);
+}
+
 static void handleStatus() {
   String j = "{";
   xSemaphoreTake(dataMtx, portMAX_DELAY);
@@ -1876,6 +2002,7 @@ static void handleSettings() {
   if (server.arg("fpass").length()) ftpPass = server.arg("fpass");
   shrinkOn = server.hasArg("shrink");
   fillOn = server.hasArg("fill"); prefs.putBool("fill", fillOn);
+  scaleFill = server.hasArg("pscale"); prefs.putBool("pscale", scaleFill);
   useUsb = server.hasArg("usb");
   speedMode = server.arg("speed").toInt() == 1 ? 1 : 0;
   prefs.putBool("usb", useUsb); prefs.putInt("speed", speedMode);
@@ -2060,6 +2187,7 @@ void setup() {
   minRating = prefs.getInt("minr", 3);
   shrinkOn = prefs.getBool("shrink", true);
   fillOn = prefs.getBool("fill", true);
+  scaleFill = prefs.getBool("pscale", true);
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
   speedMode = prefs.getInt("speed", 0);
@@ -2090,6 +2218,7 @@ void setup() {
   server.on("/rediscover", HTTP_POST, []() { printerFound = false; redirectHome(); });
   server.on("/usbcheck", HTTP_POST, handleUsbCheck);
   server.on("/usbdiag", HTTP_GET, []() { server.send(200, "text/plain", usbDiagText()); });
+  server.on("/printerinfo", HTTP_GET, handlePrinterInfo);
   server.on("/usbreset", HTTP_POST, []() {
     if (usbHostStarted) {
       blog("USB: switching the port off and on");
