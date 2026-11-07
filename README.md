@@ -26,7 +26,7 @@ Tested with a **Canon EOS R6 Mark II** and a **Canon SELPHY CP1500**. Other came
 
 Open **https://btltech1.github.io/esp32-photo-printer-bridge** in Chrome or Edge, plug the board's **UART** port into your computer and click **Install**.
 
-Right after installing, the page asks for your Wi-Fi (2.4 GHz, the same network as the printer). Once it's connected, **Visit Device** opens the bridge's page, which shows its IP address for the camera. Later you can also use **http://btl-photo.local**.
+Right after installing, the page asks for your Wi-Fi (2.4 GHz, the same network as the printer). Once it's connected, the dialog shows the bridge's address next to its name; that's the bridge's page, which also shows the IP address to type into the camera. You can also use **http://btl-photo.local**.
 
 If the page sits on "Wrapping up" for more than a minute (some USB-serial chips don't let the browser reopen the port straight after flashing), the firmware is already installed: reload the page, click **Install** again, pick the port, and choose **Connect to Wi-Fi**. The bridge also creates a Wi-Fi network called **BTL-Photo-Setup**: join it and go to `http://192.168.4.1` to enter your Wi-Fi there instead.
 

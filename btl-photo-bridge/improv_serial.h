@@ -4,8 +4,10 @@
 // (https://www.improv-wifi.com/serial/), the part ESP Web Tools uses: device info,
 // current state, Wi-Fi network scan and Wi-Fi settings.
 //
-// Once connected it sends the bridge's address (http://<ip>), so the installer shows a
-// "Visit Device" button that opens the bridge page (which shows the IP for the camera).
+// It works like the "Improv WiFi Library" it replaces, except that it never sends a
+// device URL. Without a URL the installer shows no "Visit Device" button, so setup
+// stays on the install page from start to finish. The bridge's address is shown in the
+// device name instead (see setDeviceName).
 //
 // Packet: "IMPROV" <version 1> <type> <length> <data...> <checksum> '\n'
 // checksum = low byte of the sum of every byte before it. The newline is not part of
@@ -27,6 +29,8 @@ public:
     fwName = firmwareName; fwVersion = firmwareVersion; chipName = chip; devName = deviceName;
     connect = connectFn;
   }
+
+  void setDeviceName(const char *deviceName) { devName = deviceName; }
 
   // Call from loop(). Reads whatever has arrived; other serial bytes are ignored.
   void handle() {
@@ -79,7 +83,7 @@ private:
       case CMD_GET_CURRENT_STATE:
         if (WiFi.status() == WL_CONNECTED) {
           sendState(STATE_PROVISIONED);
-          sendUrl(cmd);
+          sendResult(cmd, nullptr, 0);                 // no URL: no "Visit Device" button
         } else {
           sendState(STATE_AUTHORIZED);
         }
@@ -102,7 +106,7 @@ private:
         if (ok) {
           sendError(ERROR_NONE);
           sendState(STATE_PROVISIONED);
-          sendUrl(cmd);
+          sendResult(cmd, nullptr, 0);                 // no URL: no "Visit Device" button
         } else {
           sendError(ERROR_UNABLE_TO_CONNECT);
           sendState(STATE_AUTHORIZED);                 // ready for another try
@@ -143,12 +147,6 @@ private:
   }
 
   // ---- sending
-  void sendUrl(uint8_t cmd) {
-    String url = "http://" + WiFi.localIP().toString();
-    const char *u[1] = {url.c_str()};
-    sendResult(cmd, u, 1);
-  }
-
   void sendState(uint8_t state) { sendPacket(TYPE_CURRENT_STATE, &state, 1); }
   void sendError(uint8_t error) { sendPacket(TYPE_ERROR_STATE, &error, 1); }
 
