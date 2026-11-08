@@ -47,8 +47,9 @@
 #include "soc/rtc_cntl_reg.h"
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
+#include "btl_screen.h"       // optional 2.8" touchscreen
 
-#define FW_VERSION    "0.8.6"
+#define FW_VERSION    "0.9.0"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -81,6 +82,13 @@ volatile bool saveScaleFill = false;
 int    cassCap   = 54;       // prints per ink cassette (RP-108 = 2 x 54; KP-108IN = 3 x 36)
 volatile int cassUsed = 0;   // prints since the last "New cassette"
 volatile bool saveCass = false;
+volatile bool camBusy = false;            // a photo is coming in from the camera
+volatile bool saveColor = false;          // color settings changed from the screen
+volatile int  scrLogAct = 0;              // counter reset from the screen, logged from loop()
+char lastPhotoName[40] = "", lastPhotoInfo[40] = "";
+uint32_t storStartMs = 0;
+#define notePhoto(nm, fmt, ...) do { strlcpy(lastPhotoName, (nm), sizeof(lastPhotoName)); \
+  snprintf(lastPhotoInfo, sizeof(lastPhotoInfo), fmt, ##__VA_ARGS__); } while (0)
 // The SELPHY doesn't report how much ink is left, so the bridge counts its own prints.
 int    paperCap  = 18;       // sheets loaded in the paper tray (the CP1500 tray holds 18)
 volatile int paperUsed = 0;
@@ -1168,6 +1176,7 @@ static void printTask(void*) {
           if (st < 0x0100) {
             blog("Printing %s (%s) - sent over %s in %.1f s, printer took %.1f s to accept", j.name.c_str(), fmtSize(j.len).c_str(), curUsb ? "USB" : "Wi-Fi", lastSendMs / 1000.0, lastAnswerMs / 1000.0);
             countPrint();
+            notePhoto(j.name.c_str(), "from queue, %s", curUsb ? "USB" : "Wi-Fi");
             if (printMode == 1) addPrinted(j.name);
           } else if (retryable(st) && j.tries < 5) {
             done = false;
@@ -1603,7 +1612,9 @@ static void shrinkEncTask(void* arg) {
       uint32_t t = millis();
       int rows = j->th - b * j->bandRows; if (rows > j->bandRows) rows = j->bandRows;
       colorAdjust(j->bands[b & 1], (size_t)rows * j->tw, false);
+      screenThumbRows(j->bands[b & 1], b * j->bandRows, rows, false);
       enc->addRows(j->bands[b & 1], rows);
+      if (b + 1 == j->bandsTotal) screenThumbEnd();
       if (b + 1 == j->bandsTotal) enc->end();
       j->tEnc += millis() - t;
       if (j->outReady) xSemaphoreGive(j->outReady);
@@ -1797,6 +1808,7 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   if (!blk) { blog("Fast decoder: no memory for a block (%d bytes)", blkLen); jpeg_dec_close(dec); shrinkFreeWork(j); return false; }
   io.outbuf = blk;
 
+  screenThumbBegin(j->tw, j->th, j->orient);
   BtlJpegEnc* enc = new BtlJpegEnc();
   j->outCap = 512 * 1024;
   j->out = (uint8_t*)bigAlloc(j->outCap);
@@ -2021,6 +2033,7 @@ static void shrinkRun(ShrinkJob* j) {
   if (j->d && !j->eof) { j->sockBytes += drain(*j->d); j->eof = true; }   // e.g. Canon's embedded preview
 
   colorAdjust(j->frame, (size_t)j->fw * j->fh, true);
+  screenThumbBegin(j->fw, j->fh, 1); screenThumbRows(j->frame, 0, j->fh, true); screenThumbEnd();
   bool ok = fmt2jpg_cb(j->frame, frameBytes, j->fw, j->fh, PIXFORMAT_RGB888, j->quality, shrinkJpgOut, j);
   free(j->frame); j->frame = nullptr;
   if (!ok || j->outFail || !j->outLen) {
@@ -2116,6 +2129,7 @@ static String finishStream(uint16_t st, const String& name, size_t total) {
   if (st < 0x0100) {
     blog("Printing %s (%s) - sent over %s in %.1f s, printer took %.1f s to accept", name.c_str(), fmtSize(total).c_str(), curUsb ? "USB" : "Wi-Fi", lastSendMs / 1000.0, lastAnswerMs / 1000.0);
     countPrint();
+    notePhoto(name.c_str(), "%.1f s, %s", (millis() - storStartMs) / 1000.0, curUsb ? "USB" : "Wi-Fi");
     if (printMode == 1) addPrinted(name);
     return "226 Transfer complete - printing";
   }
@@ -2124,7 +2138,9 @@ static String finishStream(uint16_t st, const String& name, size_t total) {
 }
 
 // Receives one file from the camera and decides what to do with it. Returns the FTP reply.
+struct CamBusyGuard { CamBusyGuard() { camBusy = true; storStartMs = millis(); screenWake(); } ~CamBusyGuard() { camBusy = false; } };
 static String ftpStor(Client& d, const String& path) {
+  CamBusyGuard busy;
   String name = path;
   int sl = name.lastIndexOf('/');
   if (sl >= 0) name = name.substring(sl + 1);
@@ -2218,6 +2234,7 @@ static String ftpStor(Client& d, const String& path) {
         if (st < 0x0100) {
           blog("Printed live: %s (%s) - %s; printer took %.1f s to accept", name.c_str(), stars(rating).c_str(), sj.info.c_str(), lastAnswerMs / 1000.0);
           countPrint();
+          notePhoto(name.c_str(), "%.1f s, %s", (millis() - storStartMs) / 1000.0, curUsb ? "USB" : "Wi-Fi");
           if (printMode == 1) addPrinted(name);
           return "226 Transfer complete - printing";
         }
@@ -2234,6 +2251,7 @@ static String ftpStor(Client& d, const String& path) {
       if (dryRun) {
         free(sj.out);
         blog("Test mode, not printed: %s (%s) - %s", name.c_str(), stars(rating).c_str(), sj.info.c_str());
+        notePhoto(name.c_str(), "test, %.1f s", (millis() - storStartMs) / 1000.0);
         return "226 Transfer complete (test mode)";
       }
       enqueueJob(sj.out, sj.outLen, name, rating);
@@ -2461,7 +2479,9 @@ static void handleRoot() {
        "<form method=post action=/rediscover><button>Search for printer again</button></form>"
        "<form method=post action=/usbcheck><button>Check the printer over USB</button></form>"
        "<form method=post action=/usbreset><button>Restart the USB port</button></form>"
-       "<div class=mut style='margin-top:6px'><a style='color:inherit' href=/usbdiag>USB diagnostics</a> &middot; <a style='color:inherit' href=/printerinfo>Printer details</a></div></div>";
+       "<div class=mut style='margin-top:6px'><a style='color:inherit' href=/usbdiag>USB diagnostics</a> &middot; <a style='color:inherit' href=/printerinfo>Printer details</a></div>";
+  if (screenPresent()) h += "<form method=post action=/screencal style='margin-top:8px'><button>Redo screen touch setup</button></form>";
+  h += "</div>";
 
   h += "<div class=card><h2>Activity</h2><pre id=log>&hellip;</pre></div>";
 
@@ -2635,6 +2655,35 @@ static void handlePrinterInfoRaw(bool raw) {
   }
   xSemaphoreGive(printerMtx);
   server.send(200, "text/plain", o);
+}
+
+// ---- touchscreen hooks (btl_screen.cpp calls these from its own task)
+void screenGetInfo(ScreenInfo& si) {
+  memset(&si, 0, sizeof(si));
+  si.link = usbIppReady() ? 2 : printerFound ? 1 : 0;
+  xSemaphoreTake(dataMtx, portMAX_DELAY);
+  si.queued = (uint8_t)min((size_t)99, jobs.size());
+  strlcpy(si.lastName, lastPhotoName, sizeof(si.lastName));
+  strlcpy(si.lastInfo, lastPhotoInfo, sizeof(si.lastInfo));
+  xSemaphoreGive(dataMtx);
+  if (dryRun) si.state = SCR_ST_TEST;
+  else if (liveClient || printerState == 4) si.state = SCR_ST_PRINTING;
+  else if (camBusy) si.state = SCR_ST_RECEIVING;
+  else if (!si.link) si.state = SCR_ST_OFFLINE;
+  else if (printerState == 5) si.state = SCR_ST_STOPPED;
+  else si.state = SCR_ST_READY;
+  si.inkLeft = printsLeft(); si.inkCap = cassCap; si.paperLeft = paperLeft(); si.paperCap = paperCap;
+  si.warm = colWarm; si.con = colCon; si.sat = colSat;
+}
+
+void screenAction(int act, int v) {
+  switch (act) {
+    case SCR_ACT_WARM: colWarm = constrain(v, -5, 5); saveColor = true; break;
+    case SCR_ACT_CON:  colCon = constrain(v, 0, 3); saveColor = true; break;
+    case SCR_ACT_SAT:  colSat = constrain(v, 0, 3); saveColor = true; break;
+    case SCR_ACT_NEW_INK: cassUsed = 0; saveCass = true; scrLogAct = act; break;
+    case SCR_ACT_PAPER_LOADED: paperUsed = 0; saveCass = true; scrLogAct = act; break;
+  }
 }
 
 static void handleStatus() {
@@ -2888,6 +2937,8 @@ void setup() {
   bootMark(wifiOk ? "home Wi-Fi connected" : "no home Wi-Fi (keeps trying in the background)");
   if (wifiOk) improvShowAddress();
 
+  if (screenBegin()) blog("Screen: 2.8\" touchscreen found");
+  else blog("Screen: none connected");
   if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
   if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s, %u KB internal RAM free, resizer buffers %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF",
                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), resSums ? "reserved" : "NOT reserved");
@@ -2902,6 +2953,7 @@ void setup() {
   server.on("/settings", HTTP_POST, handleSettings);
   server.on("/cassette", HTTP_POST, handleCassette);
   server.on("/paper", HTTP_POST, handlePaper);
+  server.on("/screencal", HTTP_POST, []() { screenRecalibrate(); blog("Screen: touch setup started - tap the crosses on the screen"); redirectHome(); });
   server.on("/rediscover", HTTP_POST, []() { printerFound = false; redirectHome(); });
   server.on("/usbcheck", HTTP_POST, handleUsbCheck);
   server.on("/usbdiag", HTTP_GET, []() { server.send(200, "text/plain", usbDiagText()); });
@@ -2934,6 +2986,10 @@ void loop() {
   serviceImprov();
   server.handleClient();
   if (saveScaleFill) { saveScaleFill = false; prefs.putBool("pscale", scaleFill); }
+  if (saveColor) { saveColor = false; buildColor(); prefs.putInt("cwarm", colWarm); prefs.putInt("ccon", colCon); prefs.putInt("csat", colSat); }
+  if (scrLogAct) { int a = scrLogAct; scrLogAct = 0;
+    if (a == SCR_ACT_NEW_INK) blog("New ink cassette (from the screen): %d prints", cassCap);
+    else blog("Paper loaded (from the screen): %d sheets", paperCap); }
   if (saveCass) { saveCass = false; prefs.putInt("cused", cassUsed); prefs.putInt("pused", paperUsed);
     if (paperLeft() == 3) blog("Paper tray: 3 sheets left");
     if (paperLeft() == 0) blog("Paper tray: count says it's empty - refill and press Paper loaded");
