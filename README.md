@@ -65,6 +65,17 @@ Three things have to be right:
 
 The bridge's page shows "SELPHY CP1500 (USB cable)" when it's connected, and **Check the printer over USB** asks the printer for its status without printing. **USB diagnostics** shows what the board sees on its USB port.
 
+## Label and receipt printers (black and white)
+
+Plug a thermal **label printer** (Rollo, RONGTA and most cheap 4x6 printers) or a **receipt printer** into the USB port instead of the SELPHY, and the bridge prints your photos on it as black-and-white labels:
+
+- about a second per print and a couple of cents per label, and every print is a sticker
+- grays become dot patterns (dithering): **Smooth** (Floyd-Steinberg) or **Retro** (Atkinson)
+- photos are turned sideways when that fills the label better
+- thermal prints fade with heat, sunlight and time, so they're for fun prints, not keepsakes
+
+Set it up in the **Label printer** card on the bridge's page: the printer's language (TSPL, ZPL or ESC/POS), the label size and the resolution. Then press **Print a test label**. If it comes out blank or as garbage, try another language. Receipt printers use the paper's printable width: 1.9 in for 58 mm paper, 2.8 in for 80 mm.
+
 ## Touchscreen (optional)
 
 A 2.8" touchscreen on the bridge shows what it's doing without opening the web page:

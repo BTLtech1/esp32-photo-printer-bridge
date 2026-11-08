@@ -48,8 +48,9 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 #include "btl_screen.h"       // optional 2.8" touchscreen
+#include "btl_thermal.h"      // photos on thermal label / receipt printers
 
-#define FW_VERSION    "0.9.0"
+#define FW_VERSION    "0.9.1"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -97,6 +98,13 @@ volatile int paperUsed = 0;
 #define printsLeft() (cassCap - cassUsed < 0 ? 0 : cassCap - cassUsed)
 int    jpegQ     = 85;       // JPEG quality of the shrunk photo
 int    speedMode = 0;        // 0 = Best (1872x1248, the printer's native size), 1 = Fast (two thirds of that)
+// Thermal label / receipt printer (used when one is plugged into the USB port instead of the SELPHY)
+int    thermLang   = THERM_TSPL;   // TSPL, ZPL or ESC/POS
+int    thermDither = THERM_DITHER_SMOOTH;
+int    thermTone   = 0;            // -3 lighter .. +3 darker
+int    labelW10    = 40;           // label width, tenths of an inch (receipts: paper's printable width)
+int    labelH10    = 60;           // label length, tenths of an inch
+int    thermDpi    = 203;
 int    colWarm   = 0;        // -5 (cooler) .. +5 (warmer): the SELPHY's prints lean yellow, so cooler helps
 int    colCon    = 0;        // 0..3 contrast
 int    colSat    = 0;        // 0..3 color (saturation)
@@ -186,6 +194,9 @@ struct ShrinkJob {
   volatile bool sinkFail = false, sendExited = false;
   SemaphoreHandle_t outReady = nullptr;   // the encoder signals the sender when more bytes exist
   uint32_t tFirstSend = 0, tEncDone = 0, tSendDone = 0, sendWrites = 0;   // timeline of the stream to the printer
+  // thermal label mode: rows go to the ditherer instead of the JPEG encoder
+  BtlThermal* therm = nullptr;
+  const ThermalCfg* tcfg = nullptr;
 };
 class CamData;                 // camera data link, defined below (declared here for Arduino's auto-prototypes)
 std::deque<Job>     jobs;
@@ -594,6 +605,7 @@ static volatile uint8_t uNewAddr = 0;
 static volatile bool uGone = false;
 static volatile bool uReady = false;        // IPP-over-USB interface claimed, reader running
 static volatile bool uOutStuck = false;
+static volatile bool uLabel = false;        // a label/receipt printer is claimed (raw printing, no IPP)
 static uint8_t uIntf = 0xFF, uAlt = 0, uEpOut = 0, uEpIn = 0;
 static uint16_t uMpsOut = 64, uMpsIn = 64;
 // counters shown on the diagnostics page
@@ -733,6 +745,33 @@ public:
 UsbIppClient usbIpp;
 
 static bool usbIppReady() { return uReady && !uOutStuck && useUsb; }
+static bool thermalActive() { return uLabel && !uOutStuck && useUsb; }
+
+// Sends raw bytes to the printer on the USB port (label printers: the job in the printer's own language).
+static bool usbRawWrite(const uint8_t* p, size_t n) {
+  size_t done = 0;
+  while (done < n && (uLabel || uReady) && !uOutStuck) {
+    size_t k = min(n - done, (size_t)USB_OUT_BYTES);
+    memcpy(uOut->data_buffer, p + done, k);
+    uOut->device_handle = uDev;
+    uOut->bEndpointAddress = uEpOut;
+    uOut->num_bytes = k;
+    uOut->flags = (uMpsOut && (k % uMpsOut) == 0) ? USB_TRANSFER_FLAG_ZERO_PACK : 0;
+    uOut->callback = uOutCb;
+    uOut->context = nullptr;
+    uOut->timeout_ms = 0;
+    xSemaphoreTake(uOutDone, 0);
+    if (usb_host_transfer_submit(uOut) != ESP_OK) return false;
+    if (xSemaphoreTake(uOutDone, pdMS_TO_TICKS(20000)) != pdTRUE) {
+      uOutStuck = true;
+      blog("USB: printer stopped taking data - unplug and replug it");
+      return false;
+    }
+    if (!uOutOk) { blog("USB: sending to printer failed (status %d)", dOutLastSt); return false; }
+    done += k;
+  }
+  return done == n;
+}
 
 static void uClientCb(const usb_host_client_event_msg_t* msg, void* arg) {
   if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) uNewAddr = msg->new_dev.address;
@@ -753,8 +792,8 @@ static String usbStr(const usb_str_desc_t* d) {
 }
 
 static void usbClose(const char* why) {
-  bool wasReady = uReady;
-  uReady = false;
+  bool wasReady = uReady || uLabel;
+  uReady = false; uLabel = false;
   if (uDev) {
     if (uInBusy) {                                     // cancel the waiting read request
       uPump(&uInBusy, false, 300);
@@ -796,8 +835,10 @@ static void usbOpen(uint8_t addr) {
   String list;
   int ci = -1, ca = 0, cc = -1, cs = -1, cp = -1, cin = 0, cout = 0, cmi = 64, cmo = 64;
   int bi = -1, ba = 0, bin = 0, bout = 0, bmi = 64, bmo = 64;
+  int li = -1, la = 0, lout = 0, lmo = 64;            // fallback: a plain printer interface (label / receipt printers)
   auto closeIntf = [&]() {
     if (ci >= 0 && cc == 7 && cs == 1 && cp == 4 && cin && cout && bi < 0) { bi = ci; ba = ca; bin = cin; bout = cout; bmi = cmi; bmo = cmo; }
+    if (ci >= 0 && cc == 7 && cp != 4 && cout && li < 0) { li = ci; la = ca; lout = cout; lmo = cmo; }
   };
   while (p < end && p[0] >= 2) {
     if (p[1] == 0x04 && p[0] >= 9) {
@@ -815,6 +856,17 @@ static void usbOpen(uint8_t addr) {
   closeIntf();
   blog("USB: found %s (%s), interfaces:%s", prod.length() ? prod.c_str() : "a device", idb, list.c_str());
 
+  if (bi < 0 && li >= 0) {                             // a label or receipt printer: photos become black-and-white labels
+    if (usb_host_interface_claim(uClient, uDev, li, la) != ESP_OK) { blog("USB: couldn't claim interface %d", li); usbClose(""); return; }
+    uIntf = li; uAlt = la; uEpOut = lout; uEpIn = 0; uMpsOut = lmo ? lmo : 64;
+    xSemaphoreTake(dataMtx, portMAX_DELAY); usbName = prod.length() ? prod : String(idb); xSemaphoreGive(dataMtx);
+    uOutStuck = false;
+    uLabel = true;
+    setUsbState("ready (label printer)");
+    blog("USB: label printer ready (raw printing on interface %d, %s) - photos print as black-and-white labels", li,
+         thermLang == THERM_ZPL ? "ZPL" : thermLang == THERM_ESCPOS ? "ESC/POS" : "TSPL");
+    return;
+  }
   if (bi < 0) {
     blog("USB: this device doesn't offer IPP over USB (needs an interface 7/1/4), so it can't be used over USB");
     setUsbState(String("connected, but no IPP over USB (") + idb + ")");
@@ -1611,11 +1663,18 @@ static void shrinkEncTask(void* arg) {
     if (!j->encFail) {
       uint32_t t = millis();
       int rows = j->th - b * j->bandRows; if (rows > j->bandRows) rows = j->bandRows;
-      colorAdjust(j->bands[b & 1], (size_t)rows * j->tw, false);
-      screenThumbRows(j->bands[b & 1], b * j->bandRows, rows, false);
-      enc->addRows(j->bands[b & 1], rows);
-      if (b + 1 == j->bandsTotal) screenThumbEnd();
-      if (b + 1 == j->bandsTotal) enc->end();
+      if (j->therm) {
+        j->therm->toneRows(j->bands[b & 1], (size_t)rows * j->tw, false);
+        screenThumbRows(j->bands[b & 1], b * j->bandRows, rows, false);
+        j->therm->addRows(j->bands[b & 1], rows);
+        if (b + 1 == j->bandsTotal) { screenThumbEnd(); j->outLen = j->therm->build(j->out, j->outCap); if (!j->outLen) j->encFail = true; }
+      } else {
+        colorAdjust(j->bands[b & 1], (size_t)rows * j->tw, false);
+        screenThumbRows(j->bands[b & 1], b * j->bandRows, rows, false);
+        enc->addRows(j->bands[b & 1], rows);
+        if (b + 1 == j->bandsTotal) screenThumbEnd();
+        if (b + 1 == j->bandsTotal) enc->end();
+      }
       j->tEnc += millis() - t;
       if (j->outReady) xSemaphoreGive(j->outReady);
     }
@@ -1809,10 +1868,20 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   io.outbuf = blk;
 
   screenThumbBegin(j->tw, j->th, j->orient);
-  BtlJpegEnc* enc = new BtlJpegEnc();
-  j->outCap = 512 * 1024;
-  j->out = (uint8_t*)bigAlloc(j->outCap);
-  if (!enc || !j->out || !enc->begin(j->fw, j->fh, j->quality, encOut, j)) {
+  BtlJpegEnc* enc = nullptr;
+  bool encOk;
+  if (j->therm) {                                       // label: the ditherer takes the rows; 'out' gets the printer job
+    encOk = j->therm->begin(j->tw, j->th, j->orient, *j->tcfg);
+    j->outCap = encOk ? j->therm->jobSize() : 0;
+    j->out = encOk ? (uint8_t*)bigAlloc(j->outCap) : nullptr;
+    encOk = encOk && j->out;
+  } else {
+    enc = new BtlJpegEnc();
+    j->outCap = 512 * 1024;
+    j->out = (uint8_t*)bigAlloc(j->outCap);
+    encOk = enc && j->out && enc->begin(j->fw, j->fh, j->quality, encOut, j);
+  }
+  if (!encOk) {
     blog("Encoder: couldn't start for %dx%d", j->fw, j->fh);
     delete enc; free(j->out); j->out = nullptr; j->outCap = 0; free(blk); jpeg_dec_close(dec); shrinkFreeWork(j); return false;
   }
@@ -1969,9 +2038,15 @@ static void shrinkRun(ShrinkJob* j) {
   int L = max(j->iw, j->ih), S = min(j->iw, j->ih);
   int pl = j->fast ? PRINT_LONG * 2 / 3 : PRINT_LONG;      // Fast: 1248x832 (200 dpi on 4x6)
   int ps = j->fast ? PRINT_SHORT * 2 / 3 : PRINT_SHORT;
+  if (j->therm) {                                          // label: its size in dots; receipt: paper width, length follows the photo
+    const ThermalCfg& c = *j->tcfg;
+    if (c.lang == THERM_ESCPOS) { ps = c.dotsW; pl = (int)lroundf((float)c.dotsW * L / S); j->fill = true; }
+    else { pl = max(c.dotsW, c.dotsH); ps = min(c.dotsW, c.dotsH); }
+    pl = min(pl, PRINT_LONG);                              // the resizer's buffers are sized for the SELPHY
+  }
   // fit: whole photo on the paper (white strips if it isn't 3:2); fill: cover the paper, trim the rest
   float k = j->fill ? max((float)pl / L, (float)ps / S) : min((float)pl / L, (float)ps / S);
-  if (k >= 0.999f) { j->why = "already print size"; return; }
+  if (k >= 0.999f) { j->why = j->therm ? "the photo is smaller than the label (set the camera to a bigger JPEG size)" : "already print size"; return; }
   int tL = j->fill ? pl : max(1, (int)lroundf(L * k)), tS = j->fill ? ps : max(1, (int)lroundf(S * k));
   if (j->iw >= j->ih) { j->tw = tL; j->th = tS; } else { j->tw = tS; j->th = tL; }
   j->kScale = k;
@@ -2032,9 +2107,23 @@ static void shrinkRun(ShrinkJob* j) {
   uint32_t t1 = millis();
   if (j->d && !j->eof) { j->sockBytes += drain(*j->d); j->eof = true; }   // e.g. Canon's embedded preview
 
-  colorAdjust(j->frame, (size_t)j->fw * j->fh, true);
-  screenThumbBegin(j->fw, j->fh, 1); screenThumbRows(j->frame, 0, j->fh, true); screenThumbEnd();
-  bool ok = fmt2jpg_cb(j->frame, frameBytes, j->fw, j->fh, PIXFORMAT_RGB888, j->quality, shrinkJpgOut, j);
+  bool ok;
+  if (j->therm) {                                       // label: dither the finished frame (already upright)
+    ok = j->therm->begin(j->fw, j->fh, 1, *j->tcfg);
+    if (ok) {
+      j->therm->toneRows(j->frame, (size_t)j->fw * j->fh, true);
+      screenThumbBegin(j->fw, j->fh, 1); screenThumbRows(j->frame, 0, j->fh, true); screenThumbEnd();
+      j->therm->addRows(j->frame, j->fh);
+      j->outCap = j->therm->jobSize();
+      j->out = (uint8_t*)bigAlloc(j->outCap);
+      j->outLen = j->out ? j->therm->build(j->out, j->outCap) : 0;
+      ok = j->outLen > 0;
+    }
+  } else {
+    colorAdjust(j->frame, (size_t)j->fw * j->fh, true);
+    screenThumbBegin(j->fw, j->fh, 1); screenThumbRows(j->frame, 0, j->fh, true); screenThumbEnd();
+    ok = fmt2jpg_cb(j->frame, frameBytes, j->fw, j->fh, PIXFORMAT_RGB888, j->quality, shrinkJpgOut, j);
+  }
   free(j->frame); j->frame = nullptr;
   if (!ok || j->outFail || !j->outLen) {
     free(j->out); j->out = nullptr; j->outLen = 0;
@@ -2138,6 +2227,52 @@ static String finishStream(uint16_t st, const String& name, size_t total) {
 }
 
 // Receives one file from the camera and decides what to do with it. Returns the FTP reply.
+static ThermalCfg thermCfg() {
+  ThermalCfg c;
+  c.lang = (uint8_t)thermLang; c.dither = (uint8_t)thermDither; c.tone = (int8_t)thermTone;
+  int w = (int)lroundf(labelW10 / 10.0f * thermDpi), h = (int)lroundf(labelH10 / 10.0f * thermDpi);
+  c.dotsW = (uint16_t)max(8, (c.lang == THERM_ESCPOS ? w & ~7 : (w + 7) & ~7));   // receipts: never wider than the head
+  c.dotsH = (uint16_t)max(8, h);
+  c.widthMm = labelW10 * 2.54f; c.heightMm = labelH10 * 2.54f; c.gapMm = 3.0f;
+  return c;
+}
+
+static String thermalStor(Client& d, uint8_t* hb, size_t hn, bool eof, int orient, const String& name, int rating) {
+  ThermalCfg tc = thermCfg();
+  BtlThermal th;
+  ShrinkJob sj;
+  sj.hb = hb; sj.hn = hn; sj.d = &d; sj.eof = eof; sj.orient = orient; sj.fill = fillOn; sj.therm = &th; sj.tcfg = &tc;
+  shrinkBlocking(&sj);
+  if (sj.whole) { free(hb); hb = sj.whole; sj.whole = nullptr; }
+  free(hb);
+  th.end();
+  if (sj.result != 1) {
+    free(sj.out);
+    if (!sj.eof) drain(d);
+    blog("Could not make a label from %s: %s", name.c_str(), sj.why.length() ? sj.why.c_str() : "processing failed");
+    return "451 Could not process the photo";
+  }
+  if (dryRun) {
+    free(sj.out);
+    blog("Test mode, label not printed: %s (%s) - %s", name.c_str(), stars(rating).c_str(), sj.info.c_str());
+    notePhoto(name.c_str(), "test label, %.1f s", (millis() - storStartMs) / 1000.0);
+    return "226 Transfer complete (test mode)";
+  }
+  bool ok = false;
+  if (xSemaphoreTake(printerMtx, pdMS_TO_TICKS(10000)) == pdTRUE) {
+    uint32_t t = millis();
+    ok = usbRawWrite(sj.out, sj.outLen);
+    lastSendMs = millis() - t;
+    xSemaphoreGive(printerMtx);
+  }
+  free(sj.out);
+  if (!ok) { blog("Could not print %s: the label printer didn't take the job", name.c_str()); return "451 Printer error"; }
+  blog("Printed label: %s (%s) - %s; sent in %.1f s", name.c_str(), stars(rating).c_str(), sj.info.c_str(), lastSendMs / 1000.0);
+  notePhoto(name.c_str(), "%.1f s, label", (millis() - storStartMs) / 1000.0);
+  if (printMode == 1) addPrinted(name);
+  return "226 Transfer complete - printing";
+}
+
 struct CamBusyGuard { CamBusyGuard() { camBusy = true; storStartMs = millis(); screenWake(); } ~CamBusyGuard() { camBusy = false; } };
 static String ftpStor(Client& d, const String& path) {
   CamBusyGuard busy;
@@ -2183,6 +2318,9 @@ static String ftpStor(Client& d, const String& path) {
       return "226 Received (already printed)";
     }
   }
+
+  // 2b. A label printer is on the USB port: make a black-and-white label instead.
+  if (thermalActive() && psramFound()) return thermalStor(d, hb, hn, eof, orient, name, rating);
 
   // 3. Shrink to print size (much faster to print). If the printer is free, the print job is opened
   //    first and the result streams straight into it; otherwise the result waits in the queue.
@@ -2534,6 +2672,33 @@ static void handleRoot() {
        "<form method=post action=/clearhist><button>Forget which photos were printed</button></form>"
        "<div class=mut style='margin-top:6px'>In star-rating mode each photo prints once; this lets them print again.</div></div>";
 
+  // Label / receipt printer: used automatically when one is plugged into the USB port instead of the SELPHY.
+  h += "<div class=card><h2>Label printer</h2><div class=mut>Plug a thermal label printer (Rollo, RONGTA and similar) or a receipt printer "
+       "into the USB port instead of the SELPHY, and photos print as black-and-white labels: about a second per print, a couple of cents each. "
+       "Thermal prints fade over time.</div><form method=post action=/labelsettings>";
+  {
+    const char* ln[3] = { "TSPL (most cheap 4x6 label printers)", "ZPL (Zebra and compatibles)", "ESC/POS (receipt printers)" };
+    h += "<label>Printer language <select name=tlang>";
+    for (int i = 0; i < 3; i++) h += "<option value=" + String(i) + (thermLang == i ? " selected>" : ">") + ln[i] + "</option>";
+    h += "</select> <span class=mut>(not sure? print a test label below in each)</span></label>";
+    char wb[8], hb2[8]; snprintf(wb, sizeof(wb), "%.1f", labelW10 / 10.0); snprintf(hb2, sizeof(hb2), "%.1f", labelH10 / 10.0);
+    h += String("<label>Label size <input name=lw type=number step=0.1 min=1 max=4.5 style='width:5em' value=") + wb + "> x "
+         "<input name=lh type=number step=0.1 min=1 max=12 style='width:5em' value=" + hb2 + "> inches "
+         "<span class=mut>(width across the printer x length; receipts: 1.9 for 58 mm paper, 2.8 for 80 mm)</span></label>";
+    h += "<label>Printer resolution <select name=tdpi>";
+    h += String("<option value=203") + (thermDpi == 203 ? " selected" : "") + ">203 dpi (most label and receipt printers)</option>";
+    h += String("<option value=300") + (thermDpi == 300 ? " selected" : "") + ">300 dpi</option></select></label>";
+    h += "<label>Dot style <select name=tdith>";
+    h += String("<option value=0") + (thermDither == 0 ? " selected" : "") + ">Smooth (Floyd-Steinberg)</option>";
+    h += String("<option value=1") + (thermDither == 1 ? " selected" : "") + ">Retro, punchier (Atkinson)</option></select></label>";
+    h += "<label>Tone <select name=ttone>";
+    for (int v = -3; v <= 3; v++)
+      h += "<option value=" + String(v) + (v == thermTone ? " selected>" : ">") + (v == 0 ? String("Normal") : v < 0 ? "Lighter " + String(-v) : "Darker " + String(v)) + "</option>";
+    h += "</select></label><button>Save</button></form>"
+         "<form method=post action=/labeltest style='margin-top:8px'><button>Print a test label</button> "
+         "<span class=mut>(in the language chosen above; blank or garbage means try another language)</span></form></div>";
+  }
+
   h += "<div class=card><h2>Camera setup (Canon FTP transfer)</h2><table>";
   if (apOn)
     h += "<tr><td>Wi-Fi network</td><td><b>" + esc(apSsid) + "</b>, password <b>" + esc(apPass) + "</b> <span class=mut>(the bridge's own network: fastest, works anywhere)</span>"
@@ -2579,6 +2744,7 @@ static void handleRoot() {
 
 // Asks the printer what it is over the USB cable and writes the answer to the activity log.
 static void handleUsbCheck() {
+  if (uLabel) { blog("USB check: a label printer is connected (%s) - use Print a test label to check it", usbName.c_str()); redirectHome(); return; }
   if (!uReady) { blog("USB check: no printer on the USB port (%s)", getUsbState().c_str()); redirectHome(); return; }
   if (xSemaphoreTake(printerMtx, pdMS_TO_TICKS(5000)) != pdTRUE) { blog("USB check: printer busy, try again"); redirectHome(); return; }
   bool was = useUsb; useUsb = true;
@@ -2660,7 +2826,7 @@ static void handlePrinterInfoRaw(bool raw) {
 // ---- touchscreen hooks (btl_screen.cpp calls these from its own task)
 void screenGetInfo(ScreenInfo& si) {
   memset(&si, 0, sizeof(si));
-  si.link = usbIppReady() ? 2 : printerFound ? 1 : 0;
+  si.link = (usbIppReady() || thermalActive()) ? 2 : printerFound ? 1 : 0;
   xSemaphoreTake(dataMtx, portMAX_DELAY);
   si.queued = (uint8_t)min((size_t)99, jobs.size());
   strlcpy(si.lastName, lastPhotoName, sizeof(si.lastName));
@@ -2670,7 +2836,7 @@ void screenGetInfo(ScreenInfo& si) {
   else if (liveClient || printerState == 4) si.state = SCR_ST_PRINTING;
   else if (camBusy) si.state = SCR_ST_RECEIVING;
   else if (!si.link) si.state = SCR_ST_OFFLINE;
-  else if (printerState == 5) si.state = SCR_ST_STOPPED;
+  else if (printerState == 5 && !thermalActive()) si.state = SCR_ST_STOPPED;
   else si.state = SCR_ST_READY;
   si.inkLeft = printsLeft(); si.inkCap = cassCap; si.paperLeft = paperLeft(); si.paperCap = paperCap;
   si.warm = colWarm; si.con = colCon; si.sat = colSat;
@@ -2691,10 +2857,11 @@ static void handleStatus() {
   String j = "{";
   xSemaphoreTake(dataMtx, portMAX_DELAY);
   String pst = dryRun ? "TEST MODE - nothing will print" : printerState == 3 ? "ready" : printerState == 4 ? "printing" : printerState == 5 ? "stopped" : "unknown";
-  String pn = usbIppReady() ? usbName + " (USB cable)"
+  String pn = thermalActive() ? usbName + " (USB label printer)" : usbIppReady() ? usbName + " (USB cable)"
             : printerFound ? printerName + " (Wi-Fi, " + printerIP.toString() + ")" : String("searching...");
   String us = usbState;
-  if (uReady && !useUsb) us += " (turned off in settings, using Wi-Fi)";
+  if ((uReady || uLabel) && !useUsb) us += " (turned off in settings, using Wi-Fi)";
+  if (thermalActive() && !dryRun) pst = "label printer";
   j += "\"printer\":\"" + jsonEsc(pn) + "\",\"usb\":\"" + jsonEsc(us) + "\",\"pstate\":\"" + pst + "\",\"reasons\":\"" + jsonEsc(printerReasons) +
        "\",\"queue\":" + String(jobs.size()) + ",\"left\":" + String(printsLeft()) + ",\"cap\":" + String(cassCap) + ",\"paper\":" + String(paperLeft()) + ",\"log\":[";
   for (size_t i = 0; i < logLines.size(); i++) { if (i) j += ","; j += "\"" + jsonEsc(logLines[i]) + "\""; }
@@ -2708,6 +2875,52 @@ static void handlePaper() {
   if (c >= 1 && c <= 40) { paperCap = c; prefs.putInt("pcap", paperCap); }
   paperUsed = 0; prefs.putInt("pused", 0);
   blog("Paper loaded: %d sheets", paperCap);
+  redirectHome();
+}
+
+static void handleLabelSettings() {
+  thermLang = constrain((int)server.arg("tlang").toInt(), 0, 2);
+  labelW10 = constrain((int)lroundf(server.arg("lw").toFloat() * 10), 10, 45);
+  labelH10 = constrain((int)lroundf(server.arg("lh").toFloat() * 10), 10, 120);
+  thermDpi = server.arg("tdpi").toInt() == 300 ? 300 : 203;
+  thermDither = server.arg("tdith").toInt() == 1 ? 1 : 0;
+  thermTone = constrain((int)server.arg("ttone").toInt(), -3, 3);
+  prefs.putInt("tlang", thermLang); prefs.putInt("lw10", labelW10); prefs.putInt("lh10", labelH10);
+  prefs.putInt("tdpi", thermDpi); prefs.putInt("tdith", thermDither); prefs.putInt("ttone", thermTone);
+  blog("Label printer settings saved: %s, %.1f x %.1f in, %d dpi", thermLang == THERM_ZPL ? "ZPL" : thermLang == THERM_ESCPOS ? "ESC/POS" : "TSPL",
+       labelW10 / 10.0, labelH10 / 10.0, thermDpi);
+  redirectHome();
+}
+
+// A small test in the chosen language: text and a box, so it's obvious whether the printer understood.
+static void handleLabelTest() {
+  if (!uLabel) { blog("Label test: no label printer on the USB port (%s)", getUsbState().c_str()); redirectHome(); return; }
+  ThermalCfg c = thermCfg();
+  char b[420];
+  size_t n = 0;
+  if (c.lang == THERM_ZPL) {
+    n = snprintf(b, sizeof(b), "^XA^PW%d^FO40,40^GB%d,260,4^FS^FO70,80^A0N,56,56^FDBTL Photo Bridge^FS"
+                 "^FO70,160^A0N,36,36^FDZPL works - photos will print.^FS^XZ", c.dotsW, c.dotsW - 80);
+  } else if (c.lang == THERM_ESCPOS) {
+    static const uint8_t esc[] = { 0x1B, '@', 0x1B, 'a', 1, 0x1D, '!', 0x11 };
+    static const uint8_t mid[] = { 0x1D, '!', 0x00 };
+    static const uint8_t cut[] = { 0x1D, 'V', 'B', 0x00 };
+    const char* t1 = "BTL Photo Bridge\n";
+    const char* t2 = "ESC/POS works - photos will print.\n\n\n\n";
+    memcpy(b + n, esc, sizeof(esc)); n += sizeof(esc);
+    memcpy(b + n, t1, strlen(t1)); n += strlen(t1);
+    memcpy(b + n, mid, sizeof(mid)); n += sizeof(mid);
+    memcpy(b + n, t2, strlen(t2)); n += strlen(t2);
+    memcpy(b + n, cut, sizeof(cut)); n += sizeof(cut);
+  } else {
+    n = snprintf(b, sizeof(b), "SIZE %.1f mm,%.1f mm\r\nGAP 3 mm,0 mm\r\nCLS\r\nBOX 30,30,%d,290,4\r\n"
+                 "TEXT 60,60,\"4\",0,1,1,\"BTL Photo Bridge\"\r\nTEXT 60,150,\"3\",0,1,1,\"TSPL works - photos will print.\"\r\nPRINT 1,1\r\n",
+                 c.widthMm, c.heightMm, c.dotsW - 30);
+  }
+  bool ok = false;
+  if (n && xSemaphoreTake(printerMtx, pdMS_TO_TICKS(5000)) == pdTRUE) { ok = usbRawWrite((const uint8_t*)b, n); xSemaphoreGive(printerMtx); }
+  blog(ok ? "Label test sent (%s) - did it print readable text?" : "Label test failed (%s): the printer didn't take it",
+       c.lang == THERM_ZPL ? "ZPL" : c.lang == THERM_ESCPOS ? "ESC/POS" : "TSPL");
   redirectHome();
 }
 
@@ -2912,6 +3125,8 @@ void setup() {
   dryRun = prefs.getBool("dry", false);
   jpegQ = prefs.getInt("q", 85);
   useUsb = prefs.getBool("usb", true);
+  thermLang = prefs.getInt("tlang", THERM_TSPL); labelW10 = prefs.getInt("lw10", 40); labelH10 = prefs.getInt("lh10", 60);
+  thermDpi = prefs.getInt("tdpi", 203); thermDither = prefs.getInt("tdith", 0); thermTone = prefs.getInt("ttone", 0);
   speedMode = prefs.getInt("speed", 0);
   cassCap = prefs.getInt("ccap", 54); cassUsed = prefs.getInt("cused", 0); paperCap = prefs.getInt("pcap", 18); paperUsed = prefs.getInt("pused", 0);
   colWarm = prefs.getInt("cwarm", 0); colCon = prefs.getInt("ccon", 0); colSat = prefs.getInt("csat", 0);
@@ -2953,6 +3168,8 @@ void setup() {
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/settings", HTTP_POST, handleSettings);
   server.on("/cassette", HTTP_POST, handleCassette);
+  server.on("/labelsettings", HTTP_POST, handleLabelSettings);
+  server.on("/labeltest", HTTP_POST, handleLabelTest);
   server.on("/paper", HTTP_POST, handlePaper);
   server.on("/screencal", HTTP_POST, []() { screenRecalibrate(); blog("Screen: touch setup started - tap the crosses on the screen"); redirectHome(); });
   server.on("/rediscover", HTTP_POST, []() { printerFound = false; redirectHome(); });
