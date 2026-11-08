@@ -2426,7 +2426,7 @@ static String ftpStor(Client& d, const String& path) {
   int dest = printDest(rating);
   bool selphyOk = usbIppReady() || printerFound;
   if ((dest & DEST_LABEL) && (!labelAvailable() || !psramFound())) {
-    if (dest == DEST_LABEL) blog("No label printer found - %s goes to the SELPHY instead", name.c_str());
+    if (dest == DEST_LABEL && routeStars && rating == 3) blog("No label printer found - %s goes to the SELPHY instead", name.c_str());
     dest = DEST_SELPHY;
   } else if (dest == DEST_SELPHY && !selphyOk && labelAvailable() && psramFound()) {
     dest = DEST_LABEL;                                  // only a label printer here: use it
@@ -2755,7 +2755,7 @@ static void handleRoot() {
   h += "> Pick the printer with stars: <b>3&#9733; label, 4&#9733; SELPHY, 5&#9733; both</b> <span class=mut>(rate the photo, then press SET)</span></label>"
        "<label>Other photos print on <select name=dest>";
   {
-    const char* dn[3] = { "the SELPHY", "the label printer", "both" };
+    const char* dn[3] = { "the SELPHY", "the label printer when one is connected, otherwise the SELPHY", "both (SELPHY only when no label printer)" };
     for (int i = 1; i <= 3; i++) h += "<option value=" + String(i) + (defaultDest == i ? " selected>" : ">") + dn[i - 1] + "</option>";
   }
   h += "</select></label>"
