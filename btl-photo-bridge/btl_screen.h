@@ -31,6 +31,7 @@ struct ScreenInfo {
   char    lastInfo[40];   // e.g. "3.4 s"
   int16_t inkLeft, inkCap, paperLeft, paperCap;
   int8_t  warm, con, sat; // color settings (-5..5, 0..3, 0..3)
+  uint8_t busy;           // a photo is being processed: redraw less often so printing isn't slowed
 };
 enum { SCR_ST_OFFLINE = 0, SCR_ST_READY, SCR_ST_RECEIVING, SCR_ST_PRINTING, SCR_ST_TEST, SCR_ST_STOPPED };
 

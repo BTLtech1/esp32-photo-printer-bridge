@@ -427,7 +427,7 @@ static void screenTask(void*) {
 
     if (blOn && millis() - lastActive > SLEEP_MS && page != PG_CAL) { backlight(false); page = PG_MAIN; }
 
-    if (dirty && millis() - lastDraw > 120) {
+    if (dirty && millis() - lastDraw > (cur.busy && page == PG_MAIN ? 1000u : 120u)) {
       if (page == PG_MAIN) drawMain(cur); else if (page == PG_SET) drawSettings(cur); else drawCal();
       lcdPush();
       last = cur; lastSeq = thSeq; lastPage = page; dirty = false; lastDraw = millis();

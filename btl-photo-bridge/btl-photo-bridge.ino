@@ -2674,6 +2674,7 @@ void screenGetInfo(ScreenInfo& si) {
   else si.state = SCR_ST_READY;
   si.inkLeft = printsLeft(); si.inkCap = cassCap; si.paperLeft = paperLeft(); si.paperCap = paperCap;
   si.warm = colWarm; si.con = colCon; si.sat = colSat;
+  si.busy = camBusy;
 }
 
 void screenAction(int act, int v) {
