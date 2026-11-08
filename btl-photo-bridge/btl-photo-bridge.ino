@@ -50,7 +50,7 @@
 #include "btl_screen.h"       // optional 2.8" touchscreen
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 
-#define FW_VERSION    "0.9.1"
+#define FW_VERSION    "0.9.2"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -85,6 +85,7 @@ volatile int cassUsed = 0;   // prints since the last "New cassette"
 volatile bool saveCass = false;
 volatile bool camBusy = false;            // a photo is coming in from the camera
 volatile bool saveColor = false;          // color settings changed from the screen
+volatile bool saveDest = false;           // default printer changed from the screen
 volatile int  scrLogAct = 0;              // counter reset from the screen, logged from loop()
 char lastPhotoName[40] = "", lastPhotoInfo[40] = "";
 uint32_t storStartMs = 0;
@@ -105,6 +106,16 @@ int    thermTone   = 0;            // -3 lighter .. +3 darker
 int    labelW10    = 40;           // label width, tenths of an inch (receipts: paper's printable width)
 int    labelH10    = 60;           // label length, tenths of an inch
 int    thermDpi    = 203;
+// Which printer gets each photo
+#define DEST_SELPHY 1
+#define DEST_LABEL  2
+#define DEST_BOTH   3
+bool   routeStars  = true;         // 3 stars = label, 4 = SELPHY, 5 = both
+int    defaultDest = DEST_SELPHY;  // photos without those ratings
+bool   labelFwd    = true;         // send labels to a BTL label bridge on the network when none is plugged in here
+IPAddress labelIP;                 // that bridge, once found
+String labelHostName;
+volatile bool labelOk = false;
 int    colWarm   = 0;        // -5 (cooler) .. +5 (warmer): the SELPHY's prints lean yellow, so cooler helps
 int    colCon    = 0;        // 0..3 contrast
 int    colSat    = 0;        // 0..3 color (saturation)
@@ -1207,8 +1218,12 @@ static void enqueueJob(uint8_t* data, size_t len, const String& name, int rating
 }
 
 static void printTask(void*) {
-  uint32_t lastPoll = 0, lastDiscover = 0;
+  uint32_t lastPoll = 0, lastDiscover = 0, lastLabelLook = 0;
   for (;;) {
+    if (labelFwd && !thermalActive() && (lastLabelLook == 0 || millis() - lastLabelLook > (labelOk ? 60000u : 15000u))) {
+      lastLabelLook = millis();
+      labelDiscover();
+    }
     if (!printerAvailable()) {
       if (lastDiscover == 0 || millis() - lastDiscover > 15000) {
         lastDiscover = millis();
@@ -2237,40 +2252,128 @@ static ThermalCfg thermCfg() {
   return c;
 }
 
-static String thermalStor(Client& d, uint8_t* hb, size_t hn, bool eof, int orient, const String& name, int rating) {
-  ThermalCfg tc = thermCfg();
-  BtlThermal th;
-  ShrinkJob sj;
-  sj.hb = hb; sj.hn = hn; sj.d = &d; sj.eof = eof; sj.orient = orient; sj.fill = fillOn; sj.therm = &th; sj.tcfg = &tc;
+// ---- label printing (a label printer on this bridge's USB port, or a BTL label bridge on the network)
+static bool labelAvailable() { return thermalActive() || (labelFwd && labelOk); }
+
+static bool labelSend(const uint8_t* p, size_t n) {
+  if (thermalActive()) {
+    bool ok = false;
+    if (xSemaphoreTake(printerMtx, pdMS_TO_TICKS(10000)) == pdTRUE) { ok = usbRawWrite(p, n); xSemaphoreGive(printerMtx); }
+    return ok;
+  }
+  if (!labelOk) return false;
+  WiFiClient c;
+  if (!c.connect(labelIP, 9100, 3000)) { labelOk = false; blog("Label bridge %s stopped answering", labelHostName.c_str()); return false; }
+  size_t done = 0;
+  uint32_t t0 = millis();
+  while (done < n && c.connected() && millis() - t0 < 20000) {
+    size_t k = c.write(p + done, min(n - done, (size_t)4096));
+    if (k == 0) { delay(5); continue; }
+    done += k;
+  }
+  c.flush();
+  delay(50);
+  c.stop();
+  return done == n;
+}
+
+// Makes the label job from a photo (from the socket and/or memory). The caller frees hb unless it was taken.
+static bool labelMake(ShrinkJob& sj, BtlThermal& th, ThermalCfg& tc, Client* d, uint8_t* hb, size_t hn, bool eof, int orient) {
+  tc = thermCfg();
+  sj.hb = hb; sj.hn = hn; sj.d = d; sj.eof = eof; sj.orient = orient; sj.fill = fillOn; sj.therm = &th; sj.tcfg = &tc;
   shrinkBlocking(&sj);
+  th.end();
+  return sj.result == 1;
+}
+
+// Prints the label made in sj (or logs test mode). Frees sj.out.
+static bool labelPrint(ShrinkJob& sj, const String& name, int rating) {
+  const char* where = thermalActive() ? "USB" : labelHostName.c_str();
+  if (dryRun) {
+    free(sj.out); sj.out = nullptr;
+    blog("Test mode, label not printed: %s (%s) - %s", name.c_str(), stars(rating).c_str(), sj.info.c_str());
+    notePhoto(name.c_str(), "test label, %.1f s", (millis() - storStartMs) / 1000.0);
+    return true;
+  }
+  uint32_t t = millis();
+  bool ok = labelSend(sj.out, sj.outLen);
+  uint32_t ms = millis() - t;
+  free(sj.out); sj.out = nullptr;
+  if (!ok) { blog("Could not print the label for %s: the label printer didn't take it", name.c_str()); return false; }
+  blog("Printed label: %s (%s) on %s - %s; sent in %.1f s", name.c_str(), stars(rating).c_str(), where, sj.info.c_str(), ms / 1000.0);
+  notePhoto(name.c_str(), "%.1f s, label", (millis() - storStartMs) / 1000.0);
+  return true;
+}
+
+// Label only: straight from the camera's connection.
+static String thermalStor(Client& d, uint8_t* hb, size_t hn, bool eof, int orient, const String& name, int rating) {
+  ShrinkJob sj; BtlThermal th; ThermalCfg tc;
+  bool made = labelMake(sj, th, tc, &d, hb, hn, eof, orient);
   if (sj.whole) { free(hb); hb = sj.whole; sj.whole = nullptr; }
   free(hb);
-  th.end();
-  if (sj.result != 1) {
+  if (!made) {
     free(sj.out);
     if (!sj.eof) drain(d);
     blog("Could not make a label from %s: %s", name.c_str(), sj.why.length() ? sj.why.c_str() : "processing failed");
     return "451 Could not process the photo";
   }
-  if (dryRun) {
-    free(sj.out);
-    blog("Test mode, label not printed: %s (%s) - %s", name.c_str(), stars(rating).c_str(), sj.info.c_str());
-    notePhoto(name.c_str(), "test label, %.1f s", (millis() - storStartMs) / 1000.0);
-    return "226 Transfer complete (test mode)";
-  }
-  bool ok = false;
-  if (xSemaphoreTake(printerMtx, pdMS_TO_TICKS(10000)) == pdTRUE) {
-    uint32_t t = millis();
-    ok = usbRawWrite(sj.out, sj.outLen);
-    lastSendMs = millis() - t;
-    xSemaphoreGive(printerMtx);
-  }
-  free(sj.out);
-  if (!ok) { blog("Could not print %s: the label printer didn't take the job", name.c_str()); return "451 Printer error"; }
-  blog("Printed label: %s (%s) - %s; sent in %.1f s", name.c_str(), stars(rating).c_str(), sj.info.c_str(), lastSendMs / 1000.0);
-  notePhoto(name.c_str(), "%.1f s, label", (millis() - storStartMs) / 1000.0);
+  if (!labelPrint(sj, name, rating)) return "451 Printer error";
   if (printMode == 1) addPrinted(name);
   return "226 Transfer complete - printing";
+}
+
+// Reads the rest of the photo into memory so it can go to two printers. Returns false (keeping what was
+// read in hb/hn, eof false) if it doesn't fit; the SELPHY path then carries on from the socket.
+static bool receiveAll(Client& d, uint8_t*& hb, size_t& hn, bool& eof) {
+  if (eof) return true;
+  const size_t KEEP = 2560 * 1024 + 1024 * 1024;       // decoder, encoder, queue, plus the label job
+  size_t room = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  if (room < KEEP + 512 * 1024) return false;
+  size_t cap = min(max(hn * 2, (size_t)(1536 * 1024)), room - KEEP);
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) return false;
+  memcpy(buf, hb, hn);
+  size_t n = hn;
+  bool full = false, err = false;
+  while (true) {
+    if (n >= cap) {
+      size_t more = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+      size_t nc = cap + min((size_t)(1024 * 1024), more > KEEP + cap ? more - KEEP - cap : (size_t)0);
+      uint8_t* nb = nc > cap ? (uint8_t*)heap_caps_realloc(buf, nc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : nullptr;
+      if (!nb) { full = true; break; }
+      buf = nb; cap = nc;
+    }
+    int got = readSome(d, buf + n, cap - n, 30000);
+    if (got < 0) { err = true; break; }
+    if (got == 0) break;
+    n += got;
+  }
+  free(hb); hb = buf; hn = n;
+  if (full || err) return false;
+  eof = true;
+  return true;
+}
+
+static int printDest(int rating) {
+  if (routeStars && rating >= 3) return rating == 3 ? DEST_LABEL : rating == 4 ? DEST_SELPHY : DEST_BOTH;
+  return defaultDest;
+}
+
+// Looks for a BTL label bridge on the camera network / home Wi-Fi (it advertises raw printing on port 9100).
+static void labelDiscover() {
+  int n = MDNS.queryService("pdl-datastream", "tcp");
+  for (int i = 0; i < n; i++) {
+    String host = MDNS.hostname(i);
+    if (!host.startsWith("btl-printer")) continue;     // only our label bridges, never a SELPHY or other printer
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    IPAddress ip = MDNS.address(i);
+#else
+    IPAddress ip = MDNS.IP(i);
+#endif
+    if (!labelOk || ip != labelIP) blog("Found label bridge: %s (%s) - labels will print there", host.c_str(), ip.toString().c_str());
+    labelIP = ip; labelHostName = host; labelOk = true;
+    return;
+  }
 }
 
 struct CamBusyGuard { CamBusyGuard() { camBusy = true; storStartMs = millis(); screenWake(); } ~CamBusyGuard() { camBusy = false; } };
@@ -2319,8 +2422,23 @@ static String ftpStor(Client& d, const String& path) {
     }
   }
 
-  // 2b. A label printer is on the USB port: make a black-and-white label instead.
-  if (thermalActive() && psramFound()) return thermalStor(d, hb, hn, eof, orient, name, rating);
+  // 2b. Which printer: star ratings (3 = label, 4 = SELPHY, 5 = both) or the default.
+  int dest = printDest(rating);
+  bool selphyOk = usbIppReady() || printerFound;
+  if ((dest & DEST_LABEL) && (!labelAvailable() || !psramFound())) {
+    if (dest == DEST_LABEL) blog("No label printer found - %s goes to the SELPHY instead", name.c_str());
+    dest = DEST_SELPHY;
+  } else if (dest == DEST_SELPHY && !selphyOk && labelAvailable() && psramFound()) {
+    dest = DEST_LABEL;                                  // only a label printer here: use it
+  }
+  if (dest == DEST_LABEL) return thermalStor(d, hb, hn, eof, orient, name, rating);
+  if (dest == DEST_BOTH) {
+    if (receiveAll(d, hb, hn, eof)) {
+      ShrinkJob ls; BtlThermal th; ThermalCfg tc;
+      if (labelMake(ls, th, tc, nullptr, hb, hn, true, orient)) labelPrint(ls, name, rating);
+      else { free(ls.out); blog("Could not make a label from %s: %s", name.c_str(), ls.why.c_str()); }
+    } else blog("%s is too big to print on both printers - SELPHY only (set the camera to a smaller JPEG size)", name.c_str());
+  }
 
   // 3. Shrink to print size (much faster to print). If the printer is free, the print job is opened
   //    first and the result streams straight into it; otherwise the result waits in the queue.
@@ -2632,6 +2750,15 @@ static void handleRoot() {
   h += "> Only print photos rated <select name=minr>";
   for (int i = 1; i <= 5; i++) h += "<option value=" + String(i) + (i == minRating ? " selected>" : ">") + String(i) + "&#9733;</option>";
   h += "</select> or more</label>"
+       "<label><input type=checkbox name=route";
+  if (routeStars) h += " checked";
+  h += "> Pick the printer with stars: <b>3&#9733; label, 4&#9733; SELPHY, 5&#9733; both</b> <span class=mut>(rate the photo, then press SET)</span></label>"
+       "<label>Other photos print on <select name=dest>";
+  {
+    const char* dn[3] = { "the SELPHY", "the label printer", "both" };
+    for (int i = 1; i <= 3; i++) h += "<option value=" + String(i) + (defaultDest == i ? " selected>" : ">") + dn[i - 1] + "</option>";
+  }
+  h += "</select></label>"
        "<label><input type=checkbox name=shrink";
   if (shrinkOn) h += " checked";
   h += "> Shrink photos to print size first <span class=mut>(prints much sooner; still the printer's full 300 dpi)</span></label>"
@@ -2694,7 +2821,13 @@ static void handleRoot() {
     h += "<label>Tone <select name=ttone>";
     for (int v = -3; v <= 3; v++)
       h += "<option value=" + String(v) + (v == thermTone ? " selected>" : ">") + (v == 0 ? String("Normal") : v < 0 ? "Lighter " + String(-v) : "Darker " + String(v)) + "</option>";
-    h += "</select></label><button>Save</button></form>"
+    h += "</select></label><label><input type=checkbox name=lfwd";
+    if (labelFwd) h += " checked";
+    h += "> No label printer plugged in here? Send labels to a <b>BTL label bridge</b> on the same Wi-Fi "
+         "<span class=mut>(in the field: set the label bridge to join " + esc(apSsid) + ")</span></label>";
+    h += "<div class=mut>Label printer now: " + (thermalActive() ? esc(usbName) + " on this bridge's USB port"
+         : labelOk ? "label bridge " + esc(labelHostName) + " (" + labelIP.toString() + ")" : String("none found")) + "</div>";
+    h += "<button>Save</button></form>"
          "<form method=post action=/labeltest style='margin-top:8px'><button>Print a test label</button> "
          "<span class=mut>(in the language chosen above; blank or garbage means try another language)</span></form></div>";
   }
@@ -2841,6 +2974,7 @@ void screenGetInfo(ScreenInfo& si) {
   si.inkLeft = printsLeft(); si.inkCap = cassCap; si.paperLeft = paperLeft(); si.paperCap = paperCap;
   si.warm = colWarm; si.con = colCon; si.sat = colSat;
   si.busy = camBusy;
+  si.dest = (uint8_t)defaultDest;
 }
 
 void screenAction(int act, int v) {
@@ -2850,6 +2984,7 @@ void screenAction(int act, int v) {
     case SCR_ACT_SAT:  colSat = constrain(v, 0, 3); saveColor = true; break;
     case SCR_ACT_NEW_INK: cassUsed = 0; saveCass = true; scrLogAct = act; break;
     case SCR_ACT_PAPER_LOADED: paperUsed = 0; saveCass = true; scrLogAct = act; break;
+    case SCR_ACT_DEST: defaultDest = constrain(v, 1, 3); saveDest = true; break;
   }
 }
 
@@ -2885,6 +3020,8 @@ static void handleLabelSettings() {
   thermDpi = server.arg("tdpi").toInt() == 300 ? 300 : 203;
   thermDither = server.arg("tdith").toInt() == 1 ? 1 : 0;
   thermTone = constrain((int)server.arg("ttone").toInt(), -3, 3);
+  labelFwd = server.hasArg("lfwd"); prefs.putBool("lfwd", labelFwd);
+  if (!labelFwd) labelOk = false;
   prefs.putInt("tlang", thermLang); prefs.putInt("lw10", labelW10); prefs.putInt("lh10", labelH10);
   prefs.putInt("tdpi", thermDpi); prefs.putInt("tdith", thermDither); prefs.putInt("ttone", thermTone);
   blog("Label printer settings saved: %s, %.1f x %.1f in, %d dpi", thermLang == THERM_ZPL ? "ZPL" : thermLang == THERM_ESCPOS ? "ESC/POS" : "TSPL",
@@ -2894,7 +3031,7 @@ static void handleLabelSettings() {
 
 // A small test in the chosen language: text and a box, so it's obvious whether the printer understood.
 static void handleLabelTest() {
-  if (!uLabel) { blog("Label test: no label printer on the USB port (%s)", getUsbState().c_str()); redirectHome(); return; }
+  if (!labelAvailable()) { blog("Label test: no label printer on the USB port and no label bridge found"); redirectHome(); return; }
   ThermalCfg c = thermCfg();
   char b[420];
   size_t n = 0;
@@ -2918,7 +3055,7 @@ static void handleLabelTest() {
                  c.widthMm, c.heightMm, c.dotsW - 30);
   }
   bool ok = false;
-  if (n && xSemaphoreTake(printerMtx, pdMS_TO_TICKS(5000)) == pdTRUE) { ok = usbRawWrite((const uint8_t*)b, n); xSemaphoreGive(printerMtx); }
+  if (n) ok = labelSend((const uint8_t*)b, n);
   blog(ok ? "Label test sent (%s) - did it print readable text?" : "Label test failed (%s): the printer didn't take it",
        c.lang == THERM_ZPL ? "ZPL" : c.lang == THERM_ESCPOS ? "ESC/POS" : "TSPL");
   redirectHome();
@@ -2934,6 +3071,9 @@ static void handleCassette() {
 
 static void handleSettings() {
   printMode = server.arg("mode") == "rating" ? 1 : 0;
+  routeStars = server.hasArg("route");
+  defaultDest = constrain((int)server.arg("dest").toInt(), 1, 3);
+  prefs.putBool("route", routeStars); prefs.putInt("dest", defaultDest);
   int r = server.arg("minr").toInt();
   if (r >= 1 && r <= 5) minRating = r;
   if (server.arg("fuser").length()) ftpUser = server.arg("fuser");
@@ -3115,6 +3255,7 @@ void setup() {
 
   prefs.begin("btlphoto", false);
   printMode = prefs.getInt("mode", 0);
+  routeStars = prefs.getBool("route", true); defaultDest = prefs.getInt("dest", DEST_SELPHY); labelFwd = prefs.getBool("lfwd", true);
   minRating = prefs.getInt("minr", 3);
   shrinkOn = prefs.getBool("shrink", true);
   fillOn = prefs.getBool("fill", true);
@@ -3204,6 +3345,7 @@ void loop() {
   serviceImprov();
   server.handleClient();
   if (saveScaleFill) { saveScaleFill = false; prefs.putBool("pscale", scaleFill); }
+  if (saveDest) { saveDest = false; prefs.putInt("dest", defaultDest); }
   if (saveColor) { saveColor = false; buildColor(); prefs.putInt("cwarm", colWarm); prefs.putInt("ccon", colCon); prefs.putInt("csat", colSat); }
   if (scrLogAct) { int a = scrLogAct; scrLogAct = 0;
     if (a == SCR_ACT_NEW_INK) blog("New ink cassette (from the screen): %d prints", cassCap);

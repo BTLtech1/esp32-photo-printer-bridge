@@ -32,11 +32,12 @@ struct ScreenInfo {
   int16_t inkLeft, inkCap, paperLeft, paperCap;
   int8_t  warm, con, sat; // color settings (-5..5, 0..3, 0..3)
   uint8_t busy;           // a photo is being processed: redraw less often so printing isn't slowed
+  uint8_t dest;           // where unrated photos print: 1 = SELPHY, 2 = label, 3 = both
 };
 enum { SCR_ST_OFFLINE = 0, SCR_ST_READY, SCR_ST_RECEIVING, SCR_ST_PRINTING, SCR_ST_TEST, SCR_ST_STOPPED };
 
 // Things the screen asks the sketch to do.
-enum { SCR_ACT_WARM = 1, SCR_ACT_CON, SCR_ACT_SAT, SCR_ACT_NEW_INK, SCR_ACT_PAPER_LOADED };
+enum { SCR_ACT_WARM = 1, SCR_ACT_CON, SCR_ACT_SAT, SCR_ACT_NEW_INK, SCR_ACT_PAPER_LOADED, SCR_ACT_DEST };
 
 // Implemented by the sketch.
 void screenGetInfo(ScreenInfo& s);

@@ -76,6 +76,21 @@ Plug a thermal **label printer** (Rollo, RONGTA and most cheap 4x6 printers) or 
 
 Set it up in the **Label printer** card on the bridge's page: the printer's language (TSPL, ZPL or ESC/POS), the label size and the resolution. Then press **Print a test label**. If it comes out blank or as garbage, try another language. Receipt printers use the paper's printable width: 1.9 in for 58 mm paper, 2.8 in for 80 mm.
 
+### Two printers at once: picking with stars
+
+With a SELPHY on this bridge and a label printer on a second board running the [BTL Print Bridge](https://github.com/BTLtech1/esp32-label-printer-bridge), each photo can go to either printer or both. Set the label bridge's Wi-Fi to this bridge's network (BTL-Photo); the photo bridge finds it by itself and sends it the finished label.
+
+On the camera, rate the photo before pressing SET:
+
+| Rating | Prints on |
+|---|---|
+| 3&#9733; | the label printer |
+| 4&#9733; | the SELPHY |
+| 5&#9733; | both |
+| anything else | the default (bridge page or the touchscreen's **Print on**) |
+
+"Both" needs the whole photo in memory, which works for the camera's smaller JPEG sizes (S1, S2). A full-size JPEG prints on the SELPHY only.
+
 ## Touchscreen (optional)
 
 A 2.8" touchscreen on the bridge shows what it's doing without opening the web page:

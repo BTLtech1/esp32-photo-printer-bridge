@@ -250,7 +250,7 @@ static int hit(int x, int y) {
 
 // ---------------------------------------------------------------- pages
 enum { PG_MAIN, PG_SET, PG_CAL };
-enum { B_SETTINGS = 1, B_DONE, B_WARM_M, B_WARM_P, B_CON_M, B_CON_P, B_SAT_M, B_SAT_P, B_INK, B_PAPER, B_CAL };
+enum { B_SETTINGS = 1, B_DONE, B_WARM_M, B_WARM_P, B_CON_M, B_CON_P, B_SAT_M, B_SAT_P, B_INK, B_PAPER, B_CAL, B_DEST_M, B_DEST_P };
 static int page = PG_MAIN;
 static int confirmId = 0; static uint32_t confirmUntil = 0;
 
@@ -259,6 +259,7 @@ static const char* warmText(int v, char* b) {
   sprintf(b, v < 0 ? "Cooler %d" : "Warmer %d", v < 0 ? -v : v); return b;
 }
 static const char* stepText(int v, char* b) { if (!v) return "As shot"; sprintf(b, "+%d", v); return b; }
+static const char* destText(int d) { return d == 2 ? "Label" : d == 3 ? "Both" : "SELPHY"; }
 
 static void bar(int x, int y, int w, int left, int cap, bool warnLow) {
   rfill(x, y, w, 8, 4, LINE);
@@ -315,7 +316,7 @@ static void drawMain(const ScreenInfo& s) {
   // settings button with a summary of the color settings
   nBtn = 0;
   char sum[64], w1[16], c1[16], s1[16];
-  snprintf(sum, sizeof(sum), "%s  |  Contrast %s  |  Color %s", warmText(s.warm, w1), stepText(s.con, c1), stepText(s.sat, s1));
+  snprintf(sum, sizeof(sum), "%s  |  %s  |  C %s  |  Col %s", destText(s.dest), warmText(s.warm, w1), stepText(s.con, c1), stepText(s.sat, s1));
   rfill(8, 208, W - 16, 28, 8, BTN);
   text(font_small, 18, midY(font_small, 208, 28), sum, TXT, W - 60);
   textR(font_small, W - 18, midY(font_small, 208, 28), ">", AMBER);
@@ -323,24 +324,25 @@ static void drawMain(const ScreenInfo& s) {
 }
 
 static void stepper(int y, const char* label, const char* val, uint8_t idM, uint8_t idP) {
-  text(font_medium, 10, midY(font_medium, y, 36), label, TXT);
-  button(118, y, 44, 36, idM, "-", BTN, TXT, font_large);
-  textC(font_medium, 118 + 44 + 51, midY(font_medium, y, 36), val, AMBER);
-  button(W - 10 - 44, y, 44, 36, idP, "+", BTN, TXT, font_large);
+  text(font_medium, 10, midY(font_medium, y, 34), label, TXT);
+  button(118, y, 44, 34, idM, "-", BTN, TXT, font_large);
+  textC(font_medium, 118 + 44 + 51, midY(font_medium, y, 34), val, AMBER);
+  button(W - 10 - 44, y, 44, 34, idP, "+", BTN, TXT, font_large);
 }
 
 static void drawSettings(const ScreenInfo& s) {
   fill(0, 0, W, H, BG);
   nBtn = 0;
   char b[16];
-  stepper(6, "Warmth", warmText(s.warm, b), B_WARM_M, B_WARM_P);
-  stepper(48, "Contrast", stepText(s.con, b), B_CON_M, B_CON_P);
-  stepper(90, "Color", stepText(s.sat, b), B_SAT_M, B_SAT_P);
+  stepper(4, "Print on", destText(s.dest), B_DEST_M, B_DEST_P);
+  stepper(42, "Warmth", warmText(s.warm, b), B_WARM_M, B_WARM_P);
+  stepper(80, "Contrast", stepText(s.con, b), B_CON_M, B_CON_P);
+  stepper(118, "Color", stepText(s.sat, b), B_SAT_M, B_SAT_P);
   bool ci = confirmId == B_INK && millis() < confirmUntil, cp = confirmId == B_PAPER && millis() < confirmUntil;
-  button(8, 138, 148, 40, B_INK, ci ? "Tap to confirm" : "New ink", ci ? AMBER : BTN, ci ? DARK : TXT, font_small);
-  button(164, 138, 148, 40, B_PAPER, cp ? "Tap to confirm" : "Paper loaded", cp ? AMBER : BTN, cp ? DARK : TXT, font_small);
-  button(8, 190, 120, 44, B_CAL, "Touch setup", PANEL, MUT, font_small);
-  button(136, 190, W - 144, 44, B_DONE, "Done", AMBER, DARK);
+  button(8, 160, 148, 34, B_INK, ci ? "Tap to confirm" : "New ink", ci ? AMBER : BTN, ci ? DARK : TXT, font_small);
+  button(164, 160, 148, 34, B_PAPER, cp ? "Tap to confirm" : "Paper loaded", cp ? AMBER : BTN, cp ? DARK : TXT, font_small);
+  button(8, 200, 120, 36, B_CAL, "Touch setup", PANEL, MUT, font_small);
+  button(136, 200, W - 144, 36, B_DONE, "Done", AMBER, DARK);
 }
 
 // Calibration: tap three crosshairs.
@@ -385,6 +387,8 @@ static void onTap(int id, const ScreenInfo& s) {
       } else { confirmId = id; confirmUntil = millis() + 3000; }
       break;
     case B_CAL: page = PG_CAL; calStep = 0; break;
+    case B_DEST_M:   setVal(SCR_ACT_DEST, s.dest <= 1 ? 3 : s.dest - 1); break;
+    case B_DEST_P:   setVal(SCR_ACT_DEST, s.dest >= 3 ? 1 : s.dest + 1); break;
   }
 }
 
