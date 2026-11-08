@@ -91,6 +91,15 @@ On the camera, rate the photo before pressing SET:
 
 "Both" needs the whole photo in memory, which works for the camera's smaller JPEG sizes (S1, S2). A full-size JPEG prints on the SELPHY only.
 
+## Your website on prints
+
+Turn on **Put this in the corner of prints** in Print settings and type your website (up to 40 characters). It prints in the bottom-right corner of the photo as you see it, as white letters with a black outline and a soft gray edge so it reads on light and dark photos, on both SELPHY prints and labels. If borderless printing trims it, choose a small **Gap from the corner**.
+
+Turn it on and off without the page:
+
+- **BOOT button** on the board: **1 click** = corner text on/off (the board's light flashes green for on, red for off). **2 clicks** = next default printer (blue = SELPHY, yellow = label printer, purple = both).
+- **Touchscreen:** **Website** button in Settings.
+
 ## Touchscreen (optional)
 
 A 2.8" touchscreen on the bridge shows what it's doing without opening the web page:

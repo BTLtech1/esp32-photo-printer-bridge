@@ -250,7 +250,7 @@ static int hit(int x, int y) {
 
 // ---------------------------------------------------------------- pages
 enum { PG_MAIN, PG_SET, PG_CAL };
-enum { B_SETTINGS = 1, B_DONE, B_WARM_M, B_WARM_P, B_CON_M, B_CON_P, B_SAT_M, B_SAT_P, B_INK, B_PAPER, B_CAL, B_DEST_M, B_DEST_P };
+enum { B_SETTINGS = 1, B_DONE, B_WARM_M, B_WARM_P, B_CON_M, B_CON_P, B_SAT_M, B_SAT_P, B_INK, B_PAPER, B_CAL, B_DEST_M, B_DEST_P, B_WM };
 static int page = PG_MAIN;
 static int confirmId = 0; static uint32_t confirmUntil = 0;
 
@@ -341,8 +341,9 @@ static void drawSettings(const ScreenInfo& s) {
   bool ci = confirmId == B_INK && millis() < confirmUntil, cp = confirmId == B_PAPER && millis() < confirmUntil;
   button(8, 160, 148, 34, B_INK, ci ? "Tap to confirm" : "New ink", ci ? AMBER : BTN, ci ? DARK : TXT, font_small);
   button(164, 160, 148, 34, B_PAPER, cp ? "Tap to confirm" : "Paper loaded", cp ? AMBER : BTN, cp ? DARK : TXT, font_small);
-  button(8, 200, 120, 36, B_CAL, "Touch setup", PANEL, MUT, font_small);
-  button(136, 200, W - 144, 36, B_DONE, "Done", AMBER, DARK);
+  button(8, 200, 92, 36, B_CAL, "Touch setup", PANEL, MUT, font_small);
+  button(106, 200, 108, 36, B_WM, s.wm == 1 ? "Website: on" : s.wm == 0 ? "Website: off" : "No website", s.wm == 1 ? GREEN : BTN, s.wm == 2 ? MUT : TXT, font_small);
+  button(220, 200, W - 228, 36, B_DONE, "Done", AMBER, DARK);
 }
 
 // Calibration: tap three crosshairs.
@@ -387,6 +388,7 @@ static void onTap(int id, const ScreenInfo& s) {
       } else { confirmId = id; confirmUntil = millis() + 3000; }
       break;
     case B_CAL: page = PG_CAL; calStep = 0; break;
+    case B_WM:       if (s.wm != 2) setVal(SCR_ACT_WM, 0); break;
     case B_DEST_M:   setVal(SCR_ACT_DEST, s.dest <= 1 ? 3 : s.dest - 1); break;
     case B_DEST_P:   setVal(SCR_ACT_DEST, s.dest >= 3 ? 1 : s.dest + 1); break;
   }

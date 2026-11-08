@@ -49,8 +49,9 @@
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 #include "btl_screen.h"       // optional 2.8" touchscreen
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
+#include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.9.2"
+#define FW_VERSION    "0.9.3"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -86,6 +87,7 @@ volatile bool saveCass = false;
 volatile bool camBusy = false;            // a photo is coming in from the camera
 volatile bool saveColor = false;          // color settings changed from the screen
 volatile bool saveDest = false;           // default printer changed from the screen
+volatile bool saveWm = false;             // corner text turned on/off from the screen or BOOT button
 volatile int  scrLogAct = 0;              // counter reset from the screen, logged from loop()
 char lastPhotoName[40] = "", lastPhotoInfo[40] = "";
 uint32_t storStartMs = 0;
@@ -110,6 +112,9 @@ int    thermDpi    = 203;
 #define DEST_SELPHY 1
 #define DEST_LABEL  2
 #define DEST_BOTH   3
+bool   wmOn        = false;        // website (or any text) in the bottom-right corner of prints
+String wmText      = "";
+int    wmMargin10  = 0;            // gap from the edges, tenths of a % of the short side (0 = in the corner)
 bool   routeStars  = true;         // 3 stars = label, 4 = SELPHY, 5 = both
 int    defaultDest = DEST_SELPHY;  // photos without those ratings
 bool   labelFwd    = true;         // send labels to a BTL label bridge on the network when none is plugged in here
@@ -208,6 +213,7 @@ struct ShrinkJob {
   // thermal label mode: rows go to the ditherer instead of the JPEG encoder
   BtlThermal* therm = nullptr;
   const ThermalCfg* tcfg = nullptr;
+  BtlWatermark* wm = nullptr;          // corner text, when turned on
 };
 class CamData;                 // camera data link, defined below (declared here for Arduino's auto-prototypes)
 std::deque<Job>     jobs;
@@ -1680,11 +1686,13 @@ static void shrinkEncTask(void* arg) {
       int rows = j->th - b * j->bandRows; if (rows > j->bandRows) rows = j->bandRows;
       if (j->therm) {
         j->therm->toneRows(j->bands[b & 1], (size_t)rows * j->tw, false);
+        if (j->wm) j->wm->apply(j->bands[b & 1], b * j->bandRows, rows);
         screenThumbRows(j->bands[b & 1], b * j->bandRows, rows, false);
         j->therm->addRows(j->bands[b & 1], rows);
         if (b + 1 == j->bandsTotal) { screenThumbEnd(); j->outLen = j->therm->build(j->out, j->outCap); if (!j->outLen) j->encFail = true; }
       } else {
         colorAdjust(j->bands[b & 1], (size_t)rows * j->tw, false);
+        if (j->wm) j->wm->apply(j->bands[b & 1], b * j->bandRows, rows);
         screenThumbRows(j->bands[b & 1], b * j->bandRows, rows, false);
         enc->addRows(j->bands[b & 1], rows);
         if (b + 1 == j->bandsTotal) screenThumbEnd();
@@ -1885,6 +1893,7 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   screenThumbBegin(j->tw, j->th, j->orient);
   BtlJpegEnc* enc = nullptr;
   bool encOk;
+  wmStart(j, j->tw, j->th, j->orient);
   if (j->therm) {                                       // label: the ditherer takes the rows; 'out' gets the printer job
     encOk = j->therm->begin(j->tw, j->th, j->orient, *j->tcfg);
     j->outCap = encOk ? j->therm->jobSize() : 0;
@@ -2043,7 +2052,16 @@ static bool shrinkPrepareResampler(ShrinkJob* j) {
   return true;
 }
 
+struct WmCleanup { ShrinkJob* j; ~WmCleanup() { delete j->wm; j->wm = nullptr; } };
+static void wmStart(ShrinkJob* j, int w, int h, int orient) {
+  delete j->wm; j->wm = nullptr;
+  if (!wmOn || !wmText.length()) return;
+  j->wm = new BtlWatermark();
+  if (!j->wm->prepare(wmText.c_str(), w, h, orient, wmMargin10 / 10.0f)) { delete j->wm; j->wm = nullptr; }
+}
+
 static void shrinkRun(ShrinkJob* j) {
+  WmCleanup wmc{ j };
   j->result = 0;
   uint32_t t0 = millis();
   bool baseline = false;
@@ -2123,10 +2141,12 @@ static void shrinkRun(ShrinkJob* j) {
   if (j->d && !j->eof) { j->sockBytes += drain(*j->d); j->eof = true; }   // e.g. Canon's embedded preview
 
   bool ok;
+  wmStart(j, j->fw, j->fh, 1);
   if (j->therm) {                                       // label: dither the finished frame (already upright)
     ok = j->therm->begin(j->fw, j->fh, 1, *j->tcfg);
     if (ok) {
       j->therm->toneRows(j->frame, (size_t)j->fw * j->fh, true);
+      if (j->wm) j->wm->apply(j->frame, 0, j->fh);
       screenThumbBegin(j->fw, j->fh, 1); screenThumbRows(j->frame, 0, j->fh, true); screenThumbEnd();
       j->therm->addRows(j->frame, j->fh);
       j->outCap = j->therm->jobSize();
@@ -2136,6 +2156,7 @@ static void shrinkRun(ShrinkJob* j) {
     }
   } else {
     colorAdjust(j->frame, (size_t)j->fw * j->fh, true);
+    if (j->wm) j->wm->apply(j->frame, 0, j->fh);
     screenThumbBegin(j->fw, j->fh, 1); screenThumbRows(j->frame, 0, j->fh, true); screenThumbEnd();
     ok = fmt2jpg_cb(j->frame, frameBytes, j->fw, j->fh, PIXFORMAT_RGB888, j->quality, shrinkJpgOut, j);
   }
@@ -2759,6 +2780,14 @@ static void handleRoot() {
     for (int i = 1; i <= 3; i++) h += "<option value=" + String(i) + (defaultDest == i ? " selected>" : ">") + dn[i - 1] + "</option>";
   }
   h += "</select></label>"
+       "<label><input type=checkbox name=wm";
+  if (wmOn) h += " checked";
+  h += "> Put this in the corner of prints: <input name=wmt maxlength=40 style='width:14em' placeholder='yourwebsite.com' value='" + esc(wmText) + "'> "
+       "<span class=mut>(white with a black outline, bottom right; the board's BOOT button turns it on/off)</span></label>"
+       "<label>Gap from the corner <select name=wmm>" +
+       String("<option value=0") + (wmMargin10 == 0 ? " selected" : "") + ">None: right in the corner</option>" +
+       String("<option value=10") + (wmMargin10 == 10 ? " selected" : "") + ">Small (if borderless trims the text)</option>" +
+       String("<option value=30") + (wmMargin10 == 30 ? " selected" : "") + ">Medium</option></select></label>"
        "<label><input type=checkbox name=shrink";
   if (shrinkOn) h += " checked";
   h += "> Shrink photos to print size first <span class=mut>(prints much sooner; still the printer's full 300 dpi)</span></label>"
@@ -2975,6 +3004,7 @@ void screenGetInfo(ScreenInfo& si) {
   si.warm = colWarm; si.con = colCon; si.sat = colSat;
   si.busy = camBusy;
   si.dest = (uint8_t)defaultDest;
+  si.wm = wmText.length() ? (wmOn ? 1 : 0) : 2;
 }
 
 void screenAction(int act, int v) {
@@ -2985,6 +3015,7 @@ void screenAction(int act, int v) {
     case SCR_ACT_NEW_INK: cassUsed = 0; saveCass = true; scrLogAct = act; break;
     case SCR_ACT_PAPER_LOADED: paperUsed = 0; saveCass = true; scrLogAct = act; break;
     case SCR_ACT_DEST: defaultDest = constrain(v, 1, 3); saveDest = true; break;
+    case SCR_ACT_WM: if (wmText.length()) { wmOn = !wmOn; saveWm = true; } break;
   }
 }
 
@@ -3079,6 +3110,10 @@ static void handleSettings() {
   if (server.arg("fuser").length()) ftpUser = server.arg("fuser");
   if (server.arg("fpass").length()) ftpPass = server.arg("fpass");
   shrinkOn = server.hasArg("shrink");
+  wmOn = server.hasArg("wm");
+  wmText = server.arg("wmt"); wmText.trim(); if (wmText.length() > 40) wmText = wmText.substring(0, 40);
+  wmMargin10 = constrain((int)server.arg("wmm").toInt(), 0, 50);
+  prefs.putBool("wm", wmOn); prefs.putString("wmt", wmText); prefs.putInt("wmm", wmMargin10);
   fillOn = server.hasArg("fill"); prefs.putBool("fill", fillOn);
   scaleFill = server.hasArg("pscale"); prefs.putBool("pscale", scaleFill);
   dryRun = server.hasArg("dry"); prefs.putBool("dry", dryRun);
@@ -3243,7 +3278,39 @@ static void bootMark(const char* what) {         // progress markers in Serial M
   Serial.flush();
 }
 
+// ---- the board's BOOT button: 1 click = corner text on/off, 2 clicks = next default printer.
+// The board's color light answers: green/red = text on/off; blue/yellow/purple = SELPHY/label/both.
+static const uint8_t ledPins[] = { 48, 38 };          // the color LED is on 48 or 38 depending on the board version
+static uint32_t ledOffAt = 0;
+static void ledFlash(uint8_t r, uint8_t g, uint8_t b, uint32_t ms) {
+  for (uint8_t pin : ledPins) rgbLedWrite(pin, r, g, b);
+  ledOffAt = millis() + ms;
+}
+static void serviceBootButton() {
+  static bool was = false; static uint32_t downAt = 0, lastUp = 0; static int clicks = 0;
+  bool down = digitalRead(0) == LOW;
+  uint32_t now = millis();
+  if (down && !was && now - lastUp > 40) downAt = now;
+  if (!down && was && now - downAt > 30) { clicks++; lastUp = now; }
+  was = down;
+  if (clicks && !down && now - lastUp > 450) {           // the click series is over
+    if (clicks == 1) {
+      if (!wmText.length()) { blog("BOOT button: no corner text set yet (Print settings)"); ledFlash(40, 0, 0, 300); }
+      else { wmOn = !wmOn; saveWm = true; ledFlash(wmOn ? 0 : 40, wmOn ? 40 : 0, 0, 1200); }
+    } else {
+      defaultDest = defaultDest >= DEST_BOTH ? DEST_SELPHY : defaultDest + 1;
+      saveDest = true;
+      blog("Default printer: %s", defaultDest == DEST_LABEL ? "label printer (SELPHY when none)" : defaultDest == DEST_BOTH ? "both" : "SELPHY");
+      if (defaultDest == DEST_SELPHY) ledFlash(0, 0, 40, 1200); else if (defaultDest == DEST_LABEL) ledFlash(40, 30, 0, 1200); else ledFlash(30, 0, 40, 1200);
+    }
+    screenWake();
+    clicks = 0;
+  }
+  if (ledOffAt && (int32_t)(now - ledOffAt) >= 0) { for (uint8_t pin : ledPins) rgbLedWrite(pin, 0, 0, 0); ledOffAt = 0; }
+}
+
 void setup() {
+  pinMode(0, INPUT_PULLUP);                             // BOOT button (read in loop)
   Serial.begin(115200);
   delay(300);
   Serial.println("\nBTL Photo Printer Bridge v" FW_VERSION);
@@ -3258,6 +3325,7 @@ void setup() {
   routeStars = prefs.getBool("route", true); defaultDest = prefs.getInt("dest", DEST_SELPHY); labelFwd = prefs.getBool("lfwd", true);
   minRating = prefs.getInt("minr", 3);
   shrinkOn = prefs.getBool("shrink", true);
+  wmOn = prefs.getBool("wm", false); wmText = prefs.getString("wmt", ""); wmMargin10 = prefs.getInt("wmm", 0);
   fillOn = prefs.getBool("fill", true);
   apOn = prefs.getBool("apon", true);
   apSsid = prefs.getString("apssid", "BTL-Photo");
@@ -3346,6 +3414,8 @@ void loop() {
   server.handleClient();
   if (saveScaleFill) { saveScaleFill = false; prefs.putBool("pscale", scaleFill); }
   if (saveDest) { saveDest = false; prefs.putInt("dest", defaultDest); }
+  if (saveWm) { saveWm = false; prefs.putBool("wm", wmOn); blog("Corner text %s", wmOn ? "on" : "off"); }
+  serviceBootButton();
   if (saveColor) { saveColor = false; buildColor(); prefs.putInt("cwarm", colWarm); prefs.putInt("ccon", colCon); prefs.putInt("csat", colSat); }
   if (scrLogAct) { int a = scrLogAct; scrLogAct = 0;
     if (a == SCR_ACT_NEW_INK) blog("New ink cassette (from the screen): %d prints", cassCap);

@@ -2,10 +2,7 @@
 // Font: Inter by Rasmus Andersson, SIL Open Font License 1.1 (https://rsms.me/inter/).
 #pragma once
 #include <stdint.h>
-struct BtlGlyph { uint32_t off; uint8_t w, h; int8_t x, y; uint8_t adv; };
-struct BtlFont { const uint8_t* bits; const BtlGlyph* glyphs; uint8_t lineH, ascent; };
-#define BTL_FONT_FIRST 32
-#define BTL_FONT_LAST 126
+#include "btl_font_types.h"
 static const uint8_t font_small_bits[] = {
   9,242,0,9,242,0,9,241,0,9,241,0,8,241,0,8,241,0,8,240,0,3,96,0,
   0,0,0,9,242,0,7,226,0,7,242,189,0,6,241,189,0,6,240,172,0,5,240,155,
