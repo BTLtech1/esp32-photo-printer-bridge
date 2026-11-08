@@ -21,6 +21,7 @@ Tested with a **Canon EOS R6 Mark II** and a **Canon SELPHY CP1500**. Other came
 | A camera with FTP transfer | Canon EOS R6 Mark II, R5, R3 and others. |
 | A photo printer with IPP | Canon SELPHY CP1500 (Wi-Fi and USB). |
 | For USB printing | A USB-C to USB-A (OTG) adapter and a good USB-A to USB-C cable. See "Printing over USB". |
+| Optional touchscreen | 2.8" ILI9341 SPI TFT with XPT2046 touch, 240x320 (the common red board). See "Touchscreen". |
 
 ## Install (no Arduino needed)
 
@@ -64,6 +65,31 @@ Three things have to be right:
 
 The bridge's page shows "SELPHY CP1500 (USB cable)" when it's connected, and **Check the printer over USB** asks the printer for its status without printing. **USB diagnostics** shows what the board sees on its USB port.
 
+## Touchscreen (optional)
+
+A 2.8" touchscreen on the bridge shows what it's doing without opening the web page:
+
+- **READY / RECEIVING / PRINTING / TEST MODE / NO PRINTER**, plus how many photos are waiting
+- a preview of the photo being printed, with the color settings applied
+- **ink and paper left** (the bridge counts prints, because the SELPHY doesn't report them)
+- **Settings:** warmth, contrast and color by touch, plus **New ink** and **Paper loaded** (tap twice to confirm)
+
+The screen turns off after 3 minutes with nothing happening and wakes on a touch or a new photo. With no screen connected, the bridge works exactly the same.
+
+**Wiring** (screen pin &rarr; ESP32-S3 GPIO). The touch pins share the screen's SPI wires.
+
+| Screen | GPIO | | Screen | GPIO |
+|---|---|---|---|---|
+| VCC | 3V3 | | SDO (MISO) | 13 |
+| GND | GND | | LED | 21 |
+| CS | 10 | | T_CLK | 12 |
+| RESET | 14 | | T_CS | 8 |
+| DC | 9 | | T_DIN | 11 |
+| SDI (MOSI) | 11 | | T_DO | 13 |
+| SCK | 12 | | T_IRQ | 7 |
+
+The first time it starts, the screen asks you to tap three crosses so it knows where your touches land. To redo that later, use **Redo screen touch setup** on the bridge's page or **Touch setup** in the screen's settings.
+
 ## Build it yourself (Arduino IDE)
 
 1. **Boards Manager:** install **esp32 by Espressif**, version **3.1.1**. The newer 3.3.x versions don't finish connecting USB devices yet.
@@ -87,6 +113,8 @@ The bridge's page shows "SELPHY CP1500 (USB cable)" when it's connected, and **C
 Made by [BTL](https://btlstore.com). I designed and tested this; the code was written with help from AI (Claude).
 
 JPEG decoding and encoding use Espressif's [esp_new_jpeg](https://github.com/espressif/esp-adf-libs/tree/master/esp_new_jpeg) (precompiled, ESPRESSIF MIT License), with [TJpgDec](http://elm-chan.org/fsw/tjpgd/) by ChaN as the fallback for photos it can't handle.
+
+The touchscreen uses the [Inter](https://rsms.me/inter/) typeface by Rasmus Andersson (SIL Open Font License 1.1), converted with `tools/make_font.py`.
 
 ## License
 
