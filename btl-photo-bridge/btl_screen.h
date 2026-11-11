@@ -34,6 +34,7 @@ struct ScreenInfo {
   uint8_t busy;           // a photo is being processed: redraw less often so printing isn't slowed
   uint8_t dest;           // where unrated photos print: 1 = SELPHY, 2 = label, 3 = both
   uint8_t wm;             // corner text: 0 off, 1 on, 2 no text set
+  char    why[24];        // why the printer stopped ("OUT OF PAPER"), empty if unknown
 };
 enum { SCR_ST_OFFLINE = 0, SCR_ST_READY, SCR_ST_RECEIVING, SCR_ST_PRINTING, SCR_ST_TEST, SCR_ST_STOPPED };
 

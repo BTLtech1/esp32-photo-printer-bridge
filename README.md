@@ -125,6 +125,14 @@ The screen turns off after 3 minutes with nothing happening and wakes on a touch
 
 The first time it starts, the screen asks you to tap three crosses so it knows where your touches land. To redo that later, use **Redo screen touch setup** on the bridge's page or **Touch setup** in the screen's settings.
 
+## Keeping it safe and up to date
+
+- **Page password:** set one under **Page password** on the bridge's page (user name `btl`). Without it, anyone on the bridge's Wi-Fi can change settings or print. Forgot it? Hold the board's **BOOT** button for 5 seconds to remove it.
+- **Change the default passwords** (`printphoto` for BTL-Photo, `print` for the camera login) before using it around other people. They're printed in these instructions, and the page warns you while they're still in use.
+- **Power loss:** photos waiting in the queue are saved to the board's flash and print when power comes back. A photo that was already going to the printer when the power dropped isn't saved, but it's still on the camera's card, so send it again with SET.
+- **Updating without a cable:** **Update firmware** on the bridge's page. With home Wi-Fi and internet, press **Check for update**, then **Install**. In the field, upload the `btl-photo-bridge-x.y.z.bin` file (not `-full.bin`) from your phone. Settings, counters and waiting photos are kept.
+- **Why it stopped:** when the printer reports a problem, the screen and status page say it in plain words: OUT OF PAPER, INK USED UP, PAPER JAM, COVER OPEN, NO INK CASSETTE, NO PAPER TRAY or WRONG INK OR PAPER.
+
 ## Build it yourself (Arduino IDE)
 
 1. **Boards Manager:** install **esp32 by Espressif**, version **3.1.1**. The newer 3.3.x versions don't finish connecting USB devices yet.

@@ -37,6 +37,11 @@
 #include <stdarg.h>
 #include <vector>
 #include <deque>
+#include <algorithm>
+#include <FFat.h>               // photos waiting to print survive a power loss
+#include <Update.h>             // firmware updates over Wi-Fi
+#include <HTTPUpdate.h>
+#include <NetworkClientSecure.h>
 #include "img_converters.h"   // JPEG encoder from the ESP32 core
 #include "btl_tjpgd.h"        // JPEG decoder (TJpgDec): fallback
 #include "esp_jpeg_dec.h"     // Espressif's fast JPEG decoder (libraries/esp_new_jpeg): the normal path
@@ -51,7 +56,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.9.3"
+#define FW_VERSION    "0.9.4"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -108,6 +113,14 @@ int    thermTone   = 0;            // -3 lighter .. +3 darker
 int    labelW10    = 40;           // label width, tenths of an inch (receipts: paper's printable width)
 int    labelH10    = 60;           // label length, tenths of an inch
 int    thermDpi    = 203;
+String pagePass    = "";           // password for the bridge's page (user name "btl"); empty = no password
+bool   ffatOk      = false;        // flash storage for the waiting photos is mounted
+uint32_t nextJobId = 1;
+std::vector<uint32_t> jobFilesToDelete;  // printed photos whose saved copies loop() removes
+SemaphoreHandle_t persistMtx = nullptr;  // held while a waiting photo is being written to flash
+String latestVersion = "";         // newest version on the install page, once checked
+volatile bool otaRequested = false;
+String lastWhy = "";               // last printer problem logged
 // Which printer gets each photo
 #define DEST_SELPHY 1
 #define DEST_LABEL  2
@@ -147,7 +160,7 @@ volatile uint32_t lastSubmitMs = 0;
 static bool curUsb = false;     // the current printer conversation is over USB
 uint32_t  reqId = 1;
 
-struct Job { uint8_t* data; size_t len; String name; int rating; uint8_t tries; };
+struct Job { uint8_t* data; size_t len; String name; int rating; uint8_t tries; uint32_t id; bool saved; };
 
 // State for shrinking one photo to print size (see "shrink to print size" below).
 struct ShrinkJob {
@@ -1078,10 +1091,20 @@ static Client* printerConnect(WiFiClient& w, uint32_t timeoutMs) {
   return &w;
 }
 
+static String friendlyReason(const String& r);
 static void setPrinterStatus(int st, const String& reasons) {
   xSemaphoreTake(dataMtx, portMAX_DELAY);
   printerState = st; printerReasons = reasons;
   xSemaphoreGive(dataMtx);
+  String why = st >= 3 ? friendlyReason(reasons) : String();
+  xSemaphoreTake(dataMtx, portMAX_DELAY);
+  String was = lastWhy;
+  lastWhy = why;                                  // read by the screen and status page under the same lock
+  xSemaphoreGive(dataMtx);
+  if (why != was) {
+    if (why.length()) blog("Printer says: %s (%s)", why.c_str(), reasons.c_str());
+    else if (was.length()) blog("Printer problem cleared (%s)", was.c_str());
+  }
 }
 
 static int queryPrinterStatus() {
@@ -1219,8 +1242,97 @@ static bool retryable(uint16_t st) { return st == 0x0506 || st == 0x0507 || st =
 
 static void enqueueJob(uint8_t* data, size_t len, const String& name, int rating) {
   xSemaphoreTake(dataMtx, portMAX_DELAY);
-  jobs.push_back({ data, len, name, rating, 0 });
+  jobs.push_back({ data, len, name, rating, 0, nextJobId++, false });
   xSemaphoreGive(dataMtx);
+}
+
+// ---- waiting photos survive a power loss: each is copied to flash, removed once printed
+static String jobPath(uint32_t id, const char* ext) { char b[32]; snprintf(b, sizeof(b), "/q/%08u.%s", (unsigned)id, ext); return String(b); }
+
+// Called from loop(): writes one not-yet-saved waiting photo to flash, deletes printed ones.
+static void persistStep() {
+  if (!ffatOk) return;
+  std::vector<uint32_t> del;
+  xSemaphoreTake(dataMtx, portMAX_DELAY); del.swap(jobFilesToDelete); xSemaphoreGive(dataMtx);
+  for (uint32_t id : del) { FFat.remove(jobPath(id, "jpg")); FFat.remove(jobPath(id, "txt")); }
+  if (xSemaphoreTake(persistMtx, 0) != pdTRUE) return;
+  uint32_t id = 0; uint8_t* data = nullptr; size_t len = 0; String name; int rating = 0;
+  xSemaphoreTake(dataMtx, portMAX_DELAY);
+  for (auto& j : jobs) if (!j.saved) { id = j.id; data = j.data; len = j.len; name = j.name; rating = j.rating; break; }
+  xSemaphoreGive(dataMtx);
+  bool ok = false;
+  if (data) {
+    if (FFat.totalBytes() - FFat.usedBytes() < len + 65536) {
+      blog("Not enough room in flash to keep %s safe from a power loss", name.c_str());
+    } else {
+      File f = FFat.open(jobPath(id, "jpg"), FILE_WRITE);
+      ok = f && f.write(data, len) == len;
+      if (f) f.close();
+      File m = ok ? FFat.open(jobPath(id, "txt"), FILE_WRITE) : File();
+      ok = ok && m && m.printf("%d\n%s\n", rating, name.c_str()) > 0;
+      if (m) m.close();
+      if (!ok) { FFat.remove(jobPath(id, "jpg")); FFat.remove(jobPath(id, "txt")); }
+    }
+    xSemaphoreTake(dataMtx, portMAX_DELAY);
+    for (auto& j : jobs) if (j.id == id) j.saved = true;   // true even on failure: don't retry endlessly
+    xSemaphoreGive(dataMtx);
+  }
+  xSemaphoreGive(persistMtx);
+}
+
+// At startup: mounts the flash storage and puts photos that were still waiting back in the queue.
+static void restoreJobs() {
+  ffatOk = FFat.begin(false) || (blog("Preparing flash storage for waiting photos (first start only, takes a moment)"), FFat.begin(true));
+  if (!ffatOk) { blog("Flash storage not available - waiting photos won't survive a power loss"); return; }
+  if (!FFat.exists("/q")) FFat.mkdir("/q");
+  std::vector<uint32_t> ids;
+  File dir = FFat.open("/q");
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    String n = f.name();
+    if (n.endsWith(".txt")) ids.push_back((uint32_t)n.substring(n.lastIndexOf('/') + 1).toInt());
+    f.close();
+  }
+  dir.close();
+  std::sort(ids.begin(), ids.end());
+  int restored = 0;
+  for (uint32_t id : ids) {
+    if (id >= nextJobId) nextJobId = id + 1;
+    File m = FFat.open(jobPath(id, "txt")), f = FFat.open(jobPath(id, "jpg"));
+    int rating = m ? m.readStringUntil('\n').toInt() : 0;
+    String name = m ? m.readStringUntil('\n') : String();
+    size_t len = f ? f.size() : 0;
+    uint8_t* data = len ? (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : nullptr;
+    bool ok = data && f.read(data, len) == len && name.length();
+    if (m) m.close(); if (f) f.close();
+    if (!ok) { free(data); FFat.remove(jobPath(id, "jpg")); FFat.remove(jobPath(id, "txt")); continue; }
+    xSemaphoreTake(dataMtx, portMAX_DELAY);
+    jobs.push_back({ data, len, name, rating, 0, id, true });
+    xSemaphoreGive(dataMtx);
+    restored++;
+  }
+  if (restored) blog("Power came back: %d photo%s still waiting to print - printing %s", restored, restored == 1 ? " was" : "s were", restored == 1 ? "it" : "them");
+}
+
+// ---- the printer's reason for stopping, in plain words (empty = nothing wrong)
+static String friendlyReason(const String& r) {
+  String x = r; x.toLowerCase();
+  auto has = [&](const char* k) { int i = x.indexOf(k); return i >= 0 && x.indexOf("-report", i) != i + (int)strlen(k); };
+  if (has("media-jam") || has("jam")) return "PAPER JAM";
+  if (has("marker-supply-missing") || has("ribbon-missing")) return "NO INK CASSETTE";
+  if (has("marker-supply-empty") || has("ribbon-empty") || has("marker-supply-low-error")) return "INK USED UP";
+  if (has("input-tray-missing") || has("media-tray-missing") || has("tray-missing")) return "NO PAPER TRAY";
+  if (has("media-empty") || has("media-needed")) return "OUT OF PAPER";
+  if (has("cover-open") || has("door-open")) return "COVER OPEN";
+  if (has("mismatch") || has("media-type") || has("wrong")) return "WRONG INK OR PAPER";
+  return "";
+}
+
+// ---- the page password (user name "btl"; empty = no password)
+static bool authed() { return !pagePass.length() || server.authenticate("btl", pagePass.c_str()); }
+static bool authOrAsk() {
+  if (authed()) return true;
+  server.requestAuthentication(BASIC_AUTH, "BTL Photo Bridge", "Password needed (user name: btl). Forgot it? Hold the board's BOOT button for 5 seconds.");
+  return false;
 }
 
 static void printTask(void*) {
@@ -1257,10 +1369,14 @@ static void printTask(void*) {
           } else {
             blog("Could not print %s: %s", j.name.c_str(), ippStatusName(st).c_str());
           }
+          if (done) xSemaphoreTake(persistMtx, portMAX_DELAY);   // not while its copy is being written
           xSemaphoreTake(dataMtx, portMAX_DELAY);
-          if (done) { free(jobs.front().data); jobs.pop_front(); }
-          else jobs.front().tries++;
+          if (done) {
+            if (jobs.front().saved) jobFilesToDelete.push_back(jobs.front().id);
+            free(jobs.front().data); jobs.pop_front();
+          } else jobs.front().tries++;
           xSemaphoreGive(dataMtx);
+          if (done) xSemaphoreGive(persistMtx);
         }
         xSemaphoreGive(printerMtx);
       }
@@ -2732,6 +2848,9 @@ static void handleRoot() {
   if (apOn) h += " &middot; camera network <b>" + esc(apSsid) + "</b>: " + AP_IP.toString();
   h += " &middot; home Wi-Fi: " + ip + "</div>";
 
+  if (apOn && apPass == "printphoto" && ftpPass == "print")
+    h += "<div class='card warn'>Still using the default passwords (<b>printphoto</b> for " + esc(apSsid) + ", <b>print</b> for the camera login), "
+         "which are printed in the instructions. Before using this around other people, change them below and set a page password.</div>";
   if (!psramFound())
     h += "<div class='card warn'>PSRAM is off, so photos can't wait in a queue while the printer is busy. "
          "In Arduino IDE set Tools &rarr; PSRAM &rarr; OPI PSRAM and upload again.</div>";
@@ -2893,6 +3012,29 @@ static void handleRoot() {
        "<label>Password <input name=appass value='" + esc(apPass) + "' minlength=8 maxlength=63></label>"
        "<button>Save</button><div class=mut>At least 8 characters. The camera's address on this network is always " + AP_IP.toString() + ".</div></form></details></div>";
 
+  // Security: page password
+  h += "<div class=card><details" + String(pagePass.length() ? "" : " open") + "><summary>Page password</summary>"
+       "<form method=post action=/security>"
+       "<div class=mut>" + String(pagePass.length() ? "A password protects this page (user name <b>btl</b>)." : "<b>No password yet:</b> anyone on the bridge's Wi-Fi can change settings or print.") + "</div>"
+       "<label>New password <input name=pp1 type=password minlength=4 maxlength=32></label>"
+       "<label>Again <input name=pp2 type=password minlength=4 maxlength=32></label>"
+       "<button>Set password</button>";
+  if (pagePass.length()) h += " <button name=clear value=1>Remove password</button>";
+  h += "<div class=mut style='margin-top:6px'>Your browser asks for it once (user name <b>btl</b>). Forgot it? Hold the board's <b>BOOT</b> button for 5 seconds "
+       "to remove it. The screen and BOOT button still work without it.</div></form></details></div>";
+
+  // Firmware update over Wi-Fi
+  h += "<div class=card><details><summary>Update firmware (v" FW_VERSION ")</summary>"
+       "<form method=post action=/checkupdate style='display:inline'><button>Check for update</button></form> ";
+  if (latestVersion.length() && newerThan(latestVersion, FW_VERSION))
+    h += "<form method=post action=/onlineupdate style='display:inline'><button>Install " + esc(latestVersion) + "</button></form>";
+  else if (latestVersion.length()) h += "<span class=mut>Up to date.</span>";
+  h += "<div class=mut style='margin:6px 0 10px'>Needs home Wi-Fi with internet. Settings, counters and waiting photos are kept.</div>"
+       "<form method=post action=/update enctype=multipart/form-data>"
+       "<label>Or upload the firmware file <input type=file name=f accept='.bin'></label><button>Upload and install</button>"
+       "<div class=mut>No internet (in the field)? Download <b>btl-photo-bridge-x.y.z.bin</b> from the install page's firmware folder beforehand, "
+       "then upload it here from your phone on " + esc(apSsid) + ". Not the -full.bin file.</div></form></details></div>";
+
   h += "<div class=card><details><summary>Home Wi-Fi (optional: printer over Wi-Fi, page from your normal network)</summary><form method=post action=/savewifi>"
        "<label>Wi-Fi name <input name=ssid></label><label>Password <input name=pass type=password></label>"
        "<button>Save and restart</button><div class=mut>2.4 GHz networks only.</div></form></details></div>";
@@ -2993,17 +3135,19 @@ void screenGetInfo(ScreenInfo& si) {
   si.queued = (uint8_t)min((size_t)99, jobs.size());
   strlcpy(si.lastName, lastPhotoName, sizeof(si.lastName));
   strlcpy(si.lastInfo, lastPhotoInfo, sizeof(si.lastInfo));
+  strlcpy(si.why, lastWhy.c_str(), sizeof(si.why));
   xSemaphoreGive(dataMtx);
   if (dryRun) si.state = SCR_ST_TEST;
   else if (liveClient || printerState == 4) si.state = SCR_ST_PRINTING;
   else if (camBusy) si.state = SCR_ST_RECEIVING;
   else if (!si.link) si.state = SCR_ST_OFFLINE;
-  else if (printerState == 5 && !thermalActive()) si.state = SCR_ST_STOPPED;
+  else if ((printerState == 5 || si.why[0]) && !thermalActive()) si.state = SCR_ST_STOPPED;
   else si.state = SCR_ST_READY;
   si.inkLeft = printsLeft(); si.inkCap = cassCap; si.paperLeft = paperLeft(); si.paperCap = paperCap;
   si.warm = colWarm; si.con = colCon; si.sat = colSat;
   si.busy = camBusy;
   si.dest = (uint8_t)defaultDest;
+  if (si.state != SCR_ST_STOPPED) si.why[0] = 0;
   si.wm = wmText.length() ? (wmOn ? 1 : 0) : 2;
 }
 
@@ -3028,6 +3172,7 @@ static void handleStatus() {
   String us = usbState;
   if ((uReady || uLabel) && !useUsb) us += " (turned off in settings, using Wi-Fi)";
   if (thermalActive() && !dryRun) pst = "label printer";
+  else if (!dryRun && lastWhy.length()) pst = "stopped: " + lastWhy;
   j += "\"printer\":\"" + jsonEsc(pn) + "\",\"usb\":\"" + jsonEsc(us) + "\",\"pstate\":\"" + pst + "\",\"reasons\":\"" + jsonEsc(printerReasons) +
        "\",\"queue\":" + String(jobs.size()) + ",\"left\":" + String(printsLeft()) + ",\"cap\":" + String(cassCap) + ",\"paper\":" + String(paperLeft()) + ",\"log\":[";
   for (size_t i = 0; i < logLines.size(); i++) { if (i) j += ","; j += "\"" + jsonEsc(logLines[i]) + "\""; }
@@ -3042,6 +3187,96 @@ static void handlePaper() {
   paperUsed = 0; prefs.putInt("pused", 0);
   blog("Paper loaded: %d sheets", paperCap);
   redirectHome();
+}
+
+static void handleSecurity() {
+  String p1 = server.arg("pp1"), p2 = server.arg("pp2");
+  if (server.hasArg("clear")) { pagePass = ""; prefs.putString("pgpass", ""); blog("Page password removed"); redirectHome(); return; }
+  if (p1 != p2) { server.send(400, "text/plain", "The two passwords don't match - go back and try again."); return; }
+  if (p1.length() < 4 || p1.length() > 32) { server.send(400, "text/plain", "Password: 4 to 32 characters."); return; }
+  pagePass = p1; prefs.putString("pgpass", pagePass);
+  blog("Page password set (user name: btl)");
+  redirectHome();
+}
+
+// ---- firmware updates over Wi-Fi
+extern uint32_t restartAt;
+#define UPDATE_SITE "https://btltech1.github.io/esp32-photo-printer-bridge"
+extern const uint8_t caBundleStart[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t caBundleEnd[] asm("_binary_x509_crt_bundle_end");
+
+static bool newerThan(const String& a, const String& b) {    // "1.2.10" > "1.2.9"
+  int ai[3] = { 0 }, bi[3] = { 0 };
+  sscanf(a.c_str(), "%d.%d.%d", &ai[0], &ai[1], &ai[2]); sscanf(b.c_str(), "%d.%d.%d", &bi[0], &bi[1], &bi[2]);
+  for (int i = 0; i < 3; i++) if (ai[i] != bi[i]) return ai[i] > bi[i];
+  return false;
+}
+
+static void handleCheckUpdate() {
+  if (WiFi.status() != WL_CONNECTED) { blog("Update check: needs home Wi-Fi with internet (or upload the file instead)"); redirectHome(); return; }
+  NetworkClientSecure c;
+  c.setCACertBundle(caBundleStart, caBundleEnd - caBundleStart);
+  HTTPClient http;
+  String v;
+  if (http.begin(c, UPDATE_SITE "/version.json?x=" + String(millis())) && http.GET() == 200) {
+    String body = http.getString();
+    int i = body.indexOf("\"version\":\"");
+    if (i >= 0) { i += 11; v = body.substring(i, body.indexOf('"', i)); }
+  }
+  http.end();
+  if (!v.length()) { blog("Update check failed: couldn't reach the install page"); redirectHome(); return; }
+  latestVersion = v;
+  if (newerThan(v, FW_VERSION)) blog("Update available: %s (this bridge has %s)", v.c_str(), FW_VERSION);
+  else blog("Up to date (%s)", FW_VERSION);
+  redirectHome();
+}
+
+static void handleOnlineUpdate() {
+  if (!latestVersion.length() || !newerThan(latestVersion, FW_VERSION)) { redirectHome(); return; }
+  server.send(200, "text/html", "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+              "<meta http-equiv=refresh content='60;url=/'><body style='font-family:sans-serif;padding:20px'>"
+              "<h2>Updating to " + latestVersion + "</h2><p>Downloading and installing. The bridge restarts by itself in about a minute; "
+              "this page reloads then. Don't unplug it meanwhile.</p></body>");
+  otaRequested = true;                                   // done from loop() once this page has gone out
+}
+
+// Runs from loop(): download the new firmware from the install page and switch to it.
+static void runOnlineUpdate() {
+  otaRequested = false;
+  String url = UPDATE_SITE "/firmware/btl-photo-bridge-" + latestVersion + ".bin";
+  blog("Updating from %s", url.c_str());
+  NetworkClientSecure c;
+  c.setCACertBundle(caBundleStart, caBundleEnd - caBundleStart);
+  httpUpdate.rebootOnUpdate(true);
+  t_httpUpdate_return r = httpUpdate.update(c, url);
+  if (r != HTTP_UPDATE_OK) blog("Update failed: %s - nothing changed, still on %s", httpUpdate.getLastErrorString().c_str(), FW_VERSION);
+}
+
+// Firmware file uploaded from the page (works without internet, e.g. from a phone on BTL-Photo).
+static bool updOk = false; static String updErr;
+static void handleUploadUpdate() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    updOk = false; updErr = "";
+    if (!authed()) { updErr = "not allowed"; return; }
+    if (!up.filename.endsWith(".bin") || up.filename.endsWith("-full.bin")) { updErr = "pick the btl-photo-bridge-x.y.z.bin file (not -full.bin)"; return; }
+    blog("Firmware upload: %s", up.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) updErr = Update.errorString();
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (updErr.length()) return;
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) updErr = Update.errorString();
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (updErr.length()) { Update.abort(); return; }
+    updOk = Update.end(true);
+    if (!updOk) updErr = Update.errorString();
+  } else if (up.status == UPLOAD_FILE_ABORTED) { Update.abort(); updErr = "upload interrupted"; }
+}
+static void handleUploadUpdateDone() {
+  if (!updOk) { blog("Firmware update failed: %s - nothing changed", updErr.c_str()); redirectHome(); return; }
+  blog("Firmware updated - restarting");
+  server.send(200, "text/html", "<!doctype html><meta charset=utf-8><meta http-equiv=refresh content='20;url=/'>"
+              "<body style='font-family:sans-serif;padding:20px'><h2>Updated</h2><p>The bridge is restarting; this page reloads in 20 seconds.</p></body>");
+  restartAt = millis() + 1500;
 }
 
 static void handleLabelSettings() {
@@ -3142,7 +3377,7 @@ static void handleTestUpload() {
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
     if (upBuf) { free(upBuf); upBuf = nullptr; }
-    upLen = upCap = 0; upFail = false; upName = up.filename;
+    upLen = upCap = 0; upFail = !authed(); upName = up.filename;
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (upFail) return;
     if (upLen + up.currentSize > upCap) {
@@ -3290,8 +3525,15 @@ static void serviceBootButton() {
   static bool was = false; static uint32_t downAt = 0, lastUp = 0; static int clicks = 0;
   bool down = digitalRead(0) == LOW;
   uint32_t now = millis();
-  if (down && !was && now - lastUp > 40) downAt = now;
-  if (!down && was && now - downAt > 30) { clicks++; lastUp = now; }
+  static bool longDone = false;
+  if (down && !was && now - lastUp > 40) { downAt = now; longDone = false; }
+  if (down && !longDone && now - downAt > 5000) {          // held 5 s: remove the page password
+    longDone = true; clicks = 0;
+    pagePass = ""; prefs.putString("pgpass", "");
+    blog("BOOT button held: page password removed");
+    ledFlash(40, 40, 40, 1500);
+  }
+  if (!down && was && now - downAt > 30 && !longDone) { clicks++; lastUp = now; }
   was = down;
   if (clicks && !down && now - lastUp > 450) {           // the click series is over
     if (clicks == 1) {
@@ -3340,6 +3582,7 @@ void setup() {
   cassCap = prefs.getInt("ccap", 54); cassUsed = prefs.getInt("cused", 0); paperCap = prefs.getInt("pcap", 18); paperUsed = prefs.getInt("pused", 0);
   colWarm = prefs.getInt("cwarm", 0); colCon = prefs.getInt("ccon", 0); colSat = prefs.getInt("csat", 0);
   buildColor();
+  pagePass = prefs.getString("pgpass", "");
   ftpUser = prefs.getString("fuser", "btl");
   ftpPass = prefs.getString("fpass", "print");
 
@@ -3362,6 +3605,8 @@ void setup() {
   bootMark(wifiOk ? "home Wi-Fi connected" : "no home Wi-Fi (keeps trying in the background)");
   if (wifiOk) improvShowAddress();
 
+  persistMtx = xSemaphoreCreateMutex();
+  restoreJobs();
   if (screenBegin()) blog("Screen: 2.8\" touchscreen found");
   else blog("Screen: none connected");
   if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
@@ -3373,20 +3618,21 @@ void setup() {
   ftpCtl.begin();
   camData.listen(FTP_PASV_PORT);
 
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/status", HTTP_GET, handleStatus);
-  server.on("/settings", HTTP_POST, handleSettings);
-  server.on("/cassette", HTTP_POST, handleCassette);
-  server.on("/labelsettings", HTTP_POST, handleLabelSettings);
-  server.on("/labeltest", HTTP_POST, handleLabelTest);
-  server.on("/paper", HTTP_POST, handlePaper);
-  server.on("/screencal", HTTP_POST, []() { screenRecalibrate(); blog("Screen: touch setup started - tap the crosses on the screen"); redirectHome(); });
-  server.on("/rediscover", HTTP_POST, []() { printerFound = false; redirectHome(); });
-  server.on("/usbcheck", HTTP_POST, handleUsbCheck);
-  server.on("/usbdiag", HTTP_GET, []() { server.send(200, "text/plain", usbDiagText()); });
-  server.on("/printerinfo", HTTP_GET, handlePrinterInfo);
-  server.on("/printerraw", HTTP_GET, []() { handlePrinterInfoRaw(true); });
+  server.on("/", HTTP_GET, []() { if (authOrAsk()) handleRoot(); });
+  server.on("/status", HTTP_GET, []() { if (authOrAsk()) handleStatus(); });
+  server.on("/settings", HTTP_POST, []() { if (authOrAsk()) handleSettings(); });
+  server.on("/cassette", HTTP_POST, []() { if (authOrAsk()) handleCassette(); });
+  server.on("/labelsettings", HTTP_POST, []() { if (authOrAsk()) handleLabelSettings(); });
+  server.on("/labeltest", HTTP_POST, []() { if (authOrAsk()) handleLabelTest(); });
+  server.on("/paper", HTTP_POST, []() { if (authOrAsk()) handlePaper(); });
+  server.on("/screencal", HTTP_POST, []() { if (!authOrAsk()) return; screenRecalibrate(); blog("Screen: touch setup started - tap the crosses on the screen"); redirectHome(); });
+  server.on("/rediscover", HTTP_POST, []() { if (!authOrAsk()) return; printerFound = false; redirectHome(); });
+  server.on("/usbcheck", HTTP_POST, []() { if (authOrAsk()) handleUsbCheck(); });
+  server.on("/usbdiag", HTTP_GET, []() { if (authOrAsk()) server.send(200, "text/plain", usbDiagText()); });
+  server.on("/printerinfo", HTTP_GET, []() { if (authOrAsk()) handlePrinterInfo(); });
+  server.on("/printerraw", HTTP_GET, []() { if (authOrAsk()) handlePrinterInfoRaw(true); });
   server.on("/usbreset", HTTP_POST, []() {
+    if (!authOrAsk()) return;
     if (usbHostStarted) {
       blog("USB: switching the port off and on");
       usb_host_lib_set_root_port_power(false);
@@ -3396,13 +3642,18 @@ void setup() {
     redirectHome();
   });
   server.on("/clearhist", HTTP_POST, []() {
+    if (!authOrAsk()) return;
     xSemaphoreTake(dataMtx, portMAX_DELAY); printedNames.clear(); xSemaphoreGive(dataMtx);
     blog("Printed-photo history cleared"); redirectHome();
   });
-  server.on("/testprint", HTTP_POST, handleTestPrintDone, handleTestUpload);
-  server.on("/preview", HTTP_POST, handlePreviewDone, handleTestUpload);
-  server.on("/savewifi", HTTP_POST, handleSaveWifi);
-  server.on("/apsettings", HTTP_POST, handleApSettings);
+  server.on("/testprint", HTTP_POST, []() { if (authOrAsk()) handleTestPrintDone(); }, handleTestUpload);
+  server.on("/preview", HTTP_POST, []() { if (authOrAsk()) handlePreviewDone(); }, handleTestUpload);
+  server.on("/savewifi", HTTP_POST, []() { if (authOrAsk()) handleSaveWifi(); });
+  server.on("/apsettings", HTTP_POST, []() { if (authOrAsk()) handleApSettings(); });
+  server.on("/security", HTTP_POST, []() { if (authOrAsk()) handleSecurity(); });
+  server.on("/checkupdate", HTTP_POST, []() { if (authOrAsk()) handleCheckUpdate(); });
+  server.on("/onlineupdate", HTTP_POST, []() { if (authOrAsk()) handleOnlineUpdate(); });
+  server.on("/update", HTTP_POST, []() { if (authOrAsk()) handleUploadUpdateDone(); }, handleUploadUpdate);
   server.begin();
 
   xTaskCreatePinnedToCoreWithCaps(printTask, "print", 12288, nullptr, 1, nullptr, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -3416,6 +3667,8 @@ void loop() {
   if (saveDest) { saveDest = false; prefs.putInt("dest", defaultDest); }
   if (saveWm) { saveWm = false; prefs.putBool("wm", wmOn); blog("Corner text %s", wmOn ? "on" : "off"); }
   serviceBootButton();
+  persistStep();
+  if (otaRequested) { delay(500); runOnlineUpdate(); }
   if (saveColor) { saveColor = false; buildColor(); prefs.putInt("cwarm", colWarm); prefs.putInt("ccon", colCon); prefs.putInt("csat", colSat); }
   if (scrLogAct) { int a = scrLogAct; scrLogAct = 0;
     if (a == SCR_ACT_NEW_INK) blog("New ink cassette (from the screen): %d prints", cassCap);

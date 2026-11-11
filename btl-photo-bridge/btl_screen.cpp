@@ -285,12 +285,13 @@ static void drawMain(const ScreenInfo& s) {
     case SCR_ST_RECEIVING: st = "RECEIVING"; sb = BLUE; break;
     case SCR_ST_PRINTING:  st = "PRINTING"; sb = AMBER; sf = DARK; break;
     case SCR_ST_TEST:      st = "TEST MODE"; sb = PURPLE; break;
-    case SCR_ST_STOPPED:   st = "CHECK PRINTER"; sb = RED; break;
+    case SCR_ST_STOPPED:   st = s.why[0] ? s.why : "CHECK PRINTER"; sb = RED; break;
     default:               st = "NO PRINTER"; sb = RED; break;
   }
   if (s.queued > 0 && s.state != SCR_ST_OFFLINE) { sprintf(qb, "%s +%d", st, s.queued); st = qb; }
   rfill(8, 30, W - 16, 46, 10, sb);
-  textC(font_large, W / 2, midY(font_large, 30, 46), st, sf);
+  const BtlFont& bf = textW(font_large, st) <= W - 36 ? font_large : font_medium;   // long reasons get the smaller size
+  textC(bf, W / 2, midY(bf, 30, 46), st, sf);
   // thumbnail
   int tx = 8, ty = 84;
   fill(tx - 1, ty - 1, TW + 2, TH + 2, LINE);
