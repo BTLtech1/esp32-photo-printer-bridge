@@ -24,7 +24,7 @@
 
 // What the screen shows. Filled in by the sketch (screenGetInfo) a few times a second.
 struct ScreenInfo {
-  uint8_t link;           // 0 = no printer, 1 = Wi-Fi, 2 = USB
+  uint8_t link;           // 0 = no printer, 1 = Wi-Fi, 2 = USB, 3 = label bridge only
   uint8_t state;          // see SCR_ST_*
   uint8_t queued;         // photos waiting
   char    lastName[40];   // last photo printed (or processed in test mode)

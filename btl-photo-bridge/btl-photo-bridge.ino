@@ -3150,7 +3150,7 @@ static void handlePrinterInfoRaw(bool raw) {
 // ---- touchscreen hooks (btl_screen.cpp calls these from its own task)
 void screenGetInfo(ScreenInfo& si) {
   memset(&si, 0, sizeof(si));
-  si.link = (usbIppReady() || thermalActive()) ? 2 : printerFound ? 1 : 0;
+  si.link = (usbIppReady() || thermalActive()) ? 2 : printerFound ? 1 : (labelFwd && labelOk) ? 3 : 0;
   xSemaphoreTake(dataMtx, portMAX_DELAY);
   si.queued = (uint8_t)min((size_t)99, jobs.size());
   strlcpy(si.lastName, lastPhotoName, sizeof(si.lastName));

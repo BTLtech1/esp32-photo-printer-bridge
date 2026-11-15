@@ -273,8 +273,8 @@ static void drawMain(const ScreenInfo& s) {
   fill(0, 0, W, H, BG);
   // header
   text(font_small, 10, midY(font_small, 0, 28), "BTL Photo Bridge", AMBER);
-  const char* lk = s.link == 2 ? "USB" : s.link == 1 ? "Wi-Fi" : "No printer";
-  uint16_t lc = s.link == 2 ? GREEN : s.link == 1 ? BLUE : RED;
+  const char* lk = s.link == 2 ? "USB" : s.link == 1 ? "Wi-Fi" : s.link == 3 ? "Label bridge" : "No printer";
+  uint16_t lc = s.link == 2 ? GREEN : s.link == 1 ? BLUE : s.link == 3 ? PURPLE : RED;
   int lw = textW(font_small, lk);
   rfill(W - 10 - lw - 20, 7, 10, 10, 5, lc);
   textR(font_small, W - 10, midY(font_small, 0, 28), lk, TXT);
