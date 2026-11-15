@@ -53,10 +53,11 @@
 #include "soc/usb_serial_jtag_reg.h"
 #include "improv_serial.h"     // Wi-Fi setup from the web installer
 #include "btl_screen.h"       // optional 2.8" touchscreen
+#include "btl_oled.h"         // optional small OLED
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.9.9"
+#define FW_VERSION    "0.10.0"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -114,6 +115,7 @@ int    labelW10    = 40;           // label width, tenths of an inch (receipts: 
 int    labelH10    = 60;           // label length, tenths of an inch
 int    thermDpi    = 203;
 bool   skipResend  = true;         // the camera sends the same photo again within 3 minutes: don't print it twice
+bool   autoRefill  = true;         // reset the ink/paper count when the printer said it ran out and works again
 bool   screenForce = false;        // start the screen even if it doesn't answer the ID check
 String pagePass    = "";           // password for the bridge's page (user name "btl"); empty = no password
 bool   ffatOk      = false;        // flash storage for the waiting photos is mounted
@@ -1125,6 +1127,21 @@ static void setPrinterStatus(int st, const String& reasons) {
   if (why != was) {
     if (why.length()) blog("Printer says: %s (%s)", why.c_str(), reasons.c_str());
     else if (was.length()) blog("Printer problem cleared (%s)", was.c_str());
+  }
+  // The printer ran out and now works again: someone refilled it, so start the count over.
+  // A tray or cassette taken out only counts when the count was nearly done (not just a peek).
+  static bool paperOut = false, inkOut = false;
+  if (why == "OUT OF PAPER" || (why == "NO PAPER TRAY" && paperLeft() <= 3)) paperOut = true;
+  if (why == "INK USED UP" || (why == "NO INK CASSETTE" && printsLeft() <= 5)) inkOut = true;
+  if (!why.length() && (st == 3 || st == 4) && (paperOut || inkOut)) {
+    char l1[24] = "", l2[24] = "";
+    if (paperOut && autoRefill) { paperUsed = 0; saveCass = true; blog("Paper refilled: count set back to %d sheets", paperCap);
+                                  strcpy(l1, "Paper refilled"); snprintf(l2, sizeof(l2), "%d sheets", paperCap); }
+    if (inkOut && autoRefill) { cassUsed = 0; saveCass = true; blog("New ink cassette: count set back to %d prints", cassCap);
+                                if (l1[0]) { strcpy(l1, "Refilled"); snprintf(l2, sizeof(l2), "%d ink, %d paper", cassCap, paperCap); }
+                                else { strcpy(l1, "New ink"); snprintf(l2, sizeof(l2), "%d prints", cassCap); } }
+    if (l1[0]) oledNote(l1, l2, 3000);
+    paperOut = inkOut = false;
   }
 }
 
@@ -2959,7 +2976,10 @@ static void handleRoot() {
        String("<option value=30") + (wmMargin10 == 30 ? " selected" : "") + ">Medium</option></select></label>"
        "<label><input type=checkbox name=skipre";
   if (skipResend) h += " checked";
-  h += "> Don't print the same photo twice within 3 minutes <span class=mut>(the camera re-sends a photo after its Wi-Fi drops or it's switched off mid-send)</span></label>"
+  h += "> Don't print the same photo twice within 3 minutes <span class=mut>(the camera re-sends a photo after its Wi-Fi drops or it's switched off mid-send)</span></label>";
+  h += "<label><input type=checkbox name=autorf"; if (autoRefill) h += " checked";
+  h += "> Reset the ink and paper counts by themselves <span class=mut>(when the printer says it ran out, then prints again after you refill)</span></label>";
+  h += ""
        "<label><input type=checkbox name=shrink";
   if (shrinkOn) h += " checked";
   h += "> Shrink photos to print size first <span class=mut>(prints much sooner; still the printer's full 300 dpi)</span></label>"
@@ -3411,6 +3431,7 @@ static void handleSettings() {
   if (server.arg("fpass").length()) ftpPass = server.arg("fpass");
   shrinkOn = server.hasArg("shrink");
   skipResend = server.hasArg("skipre"); prefs.putBool("skipre", skipResend);
+  autoRefill = server.hasArg("autorf"); prefs.putBool("autorf", autoRefill);
   wmOn = server.hasArg("wm");
   wmText = server.arg("wmt"); wmText.trim(); if (wmText.length() > 40) wmText = wmText.substring(0, 40);
   wmMargin10 = constrain((int)server.arg("wmm").toInt(), 0, 50);
@@ -3634,6 +3655,7 @@ void setup() {
   minRating = prefs.getInt("minr", 3);
   shrinkOn = prefs.getBool("shrink", true);
   skipResend = prefs.getBool("skipre", true);
+  autoRefill = prefs.getBool("autorf", true);
   wmOn = prefs.getBool("wm", false); wmText = prefs.getString("wmt", ""); wmMargin10 = prefs.getInt("wmm", 0);
   fillOn = prefs.getBool("fill", true);
   apOn = prefs.getBool("apon", true);
@@ -3656,6 +3678,8 @@ void setup() {
   if (psramFound()) reserveResampler();            // while internal RAM is still clean
   liveBuf = (uint8_t*)bigAlloc(LIVE_CHUNK + 32);
   bootMark("settings loaded");
+  bool oledOk = oledBegin();                      // early, so the small screen shows something while Wi-Fi starts
+  if (oledOk) oledNote("BTL Photo Bridge", "starting...", 25000);
   improv.begin("BTL Photo Printer Bridge", FW_VERSION, "ESP32-S3", improvName, improvConnect);
   prevLog = esp_log_set_vprintf(logHook);
   esp_log_level_set("*", ESP_LOG_INFO);           // chatty until Wi-Fi is up, so boot problems show in Serial Monitor
@@ -3686,6 +3710,8 @@ void setup() {
       (screenDiagTouch > 100 && screenDiagTouch < 4000))) prefs.putBool("scrseen", true);
   else blog("Screen: no answer (ID %06X, status %02X, touch %u) - check its wiring, or turn on 'Always start the screen' if it's connected",
             (unsigned)screenDiagId, screenDiagStatus, screenDiagTouch);
+  if (oledOk) blog("Small OLED found on IO4/IO5");
+  if (oledOk) oledNote("Ready", wifiOk ? WiFi.localIP().toString().c_str() : AP_IP.toString().c_str(), 3000);
   if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
   if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s, %u KB internal RAM free, resizer buffers %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF",
                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), resSums ? "reserved" : "NOT reserved");
