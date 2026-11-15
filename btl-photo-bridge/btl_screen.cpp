@@ -477,16 +477,22 @@ bool screenBegin(bool force) {
     // Many of these screens never drive their SDO line, so ask the touch chip instead: its temperature
     // reading comes back mid-range when it's there, and as zeros (pulled down) when nothing is connected.
     bool touchAnswered = false;
-    if (!lcdAnswered) {
+    // A few tries, with the chip's reference switched on and off: one read straight after power-up
+    // sometimes comes back as zero.
+    static const uint8_t probes[] = { 0x84, 0x87, 0xA4, 0xA7, 0x84 };
+    for (int tries = 0; !lcdAnswered && !touchAnswered && tries < 10; tries++) {
+      uint8_t cmd = probes[tries % 5];
       spi->beginTransaction(SPISettings(SPI_HZ_TOUCH, MSBFIRST, SPI_MODE0));
       csTouch(true);
-      tRead(0x84);                                     // first reading after switching is noisy
-      uint16_t t = tRead(0x84);
+      tRead(cmd);                                      // first reading after switching is noisy
+      delayMicroseconds(200);
+      uint16_t t = tRead(cmd);
       tRead(0x80); spi->transfer(0); spi->transfer(0); // back to pen-interrupt mode
       csTouch(false);
       spi->endTransaction();
-      screenDiagTouch = t;
+      if (t > screenDiagTouch) screenDiagTouch = t;
       touchAnswered = t > 100 && t < 4000;
+      if (!touchAnswered) delay(30);
     }
     if (!force && !lcdAnswered && !touchAnswered) { spi->end(); delete spi; spi = nullptr; present = false; return false; }
   }

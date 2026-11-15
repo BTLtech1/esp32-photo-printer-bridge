@@ -56,7 +56,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.9.8"
+#define FW_VERSION    "0.9.9"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -3675,12 +3675,15 @@ void setup() {
   persistMtx = xSemaphoreCreateMutex();
   restoreJobs();
   screenForce = prefs.getBool("scrforce", false);
-  if (screenBegin(screenForce))
+  bool screenSeen = prefs.getBool("scrseen", false);   // a screen was found before: start it even if a check misses
+  if (screenBegin(screenForce || screenSeen))
     blog("Screen: %s (ID %06X, status %02X, touch %u)",
          (screenDiagId & 0xFFFF) == 0x9341 || (screenDiagStatus & 0x9C) == 0x9C ? "2.8\" touchscreen found"
          : (screenDiagTouch > 100 && screenDiagTouch < 4000) ? "2.8\" touchscreen found (via its touch chip)"
-         : "started without an answer (always-start is on)",
+         : screenForce ? "started without an answer (always-start is on)" : "started (found on an earlier start)",
          (unsigned)screenDiagId, screenDiagStatus, screenDiagTouch);
+  if (screenPresent() && !screenSeen && ((screenDiagId & 0xFFFF) == 0x9341 || (screenDiagStatus & 0x9C) == 0x9C ||
+      (screenDiagTouch > 100 && screenDiagTouch < 4000))) prefs.putBool("scrseen", true);
   else blog("Screen: no answer (ID %06X, status %02X, touch %u) - check its wiring, or turn on 'Always start the screen' if it's connected",
             (unsigned)screenDiagId, screenDiagStatus, screenDiagTouch);
   if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
@@ -3727,6 +3730,7 @@ void setup() {
   server.on("/screenforce", HTTP_POST, []() {
     if (!authOrAsk()) return;
     screenForce = server.hasArg("on"); prefs.putBool("scrforce", screenForce);
+    if (!screenForce && server.hasArg("forget")) prefs.putBool("scrseen", false);
     blog("Screen: always-start %s - restarting", screenForce ? "on" : "off");
     redirectHome(); restartAt = millis() + 1500;
   });
