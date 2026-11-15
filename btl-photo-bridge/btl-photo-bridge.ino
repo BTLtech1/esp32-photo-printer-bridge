@@ -56,7 +56,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.9.6"
+#define FW_VERSION    "0.9.7"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -217,7 +217,8 @@ struct ShrinkJob {
   SemaphoreHandle_t bandFull[2] = { nullptr, nullptr }, bandFree[2] = { nullptr, nullptr };
   volatile int bandCount = 0, bandsTotal = 0;
   volatile bool encExited = false;
-  TaskHandle_t encTaskH = nullptr;
+  TaskHandle_t encTaskH = nullptr, sendTaskH = nullptr;
+  bool encCaps = false;                   // encoder stack came from PSRAM (deleted with vTaskDeleteWithCaps)
   void (*sink)(void* ctx, const uint8_t* data, size_t len) = nullptr;   // where encoded bytes go as they're made
   void* sinkCtx = nullptr;
   volatile size_t sinkSent = 0;  // bytes of 'out' already handed to the sink
@@ -743,7 +744,7 @@ public:
       if (usb_host_transfer_submit(uOut) != ESP_OK) break;
       if (xSemaphoreTake(uOutDone, pdMS_TO_TICKS(20000)) != pdTRUE) {
         uOutStuck = true;
-        blog("USB: printer stopped taking data - unplug and replug it");
+        blog("USB: printer stopped taking data");
         break;
       }
       if (!uOutOk) { blog("USB: sending to printer failed (status %d)", dOutLastSt); break; }
@@ -795,7 +796,7 @@ static bool usbRawWrite(const uint8_t* p, size_t n) {
     if (usb_host_transfer_submit(uOut) != ESP_OK) return false;
     if (xSemaphoreTake(uOutDone, pdMS_TO_TICKS(20000)) != pdTRUE) {
       uOutStuck = true;
-      blog("USB: printer stopped taking data - unplug and replug it");
+      blog("USB: printer stopped taking data");
       return false;
     }
     if (!uOutOk) { blog("USB: sending to printer failed (status %d)", dOutLastSt); return false; }
@@ -1793,6 +1794,15 @@ static void colorAdjust(uint8_t* p, size_t pixels, bool bgr) {
   }
 }
 
+// Deletes a helper task once it has parked itself. A task made with ...WithCaps must be deleted by
+// another task with vTaskDeleteWithCaps, or its stack is never given back.
+static void reapTask(TaskHandle_t& h, bool caps) {
+  if (!h) return;
+  while (eTaskGetState(h) != eSuspended) vTaskDelay(1);
+  if (caps) vTaskDeleteWithCaps(h); else vTaskDelete(h);
+  h = nullptr;
+}
+
 static void shrinkEncTask(void* arg) {
   ShrinkJob* j = (ShrinkJob*)arg;
   BtlJpegEnc* enc = (BtlJpegEnc*)j->enc;
@@ -1823,7 +1833,7 @@ static void shrinkEncTask(void* arg) {
   j->tEncDone = millis();
   j->encExited = true;
   if (j->outReady) xSemaphoreGive(j->outReady);
-  vTaskDelete(nullptr);
+  vTaskSuspend(nullptr);                                  // the parent deletes it (frees the stack properly)
 }
 
 // Sender task: feeds the printer from the output buffer at the printer's own pace, so neither the
@@ -1843,7 +1853,7 @@ static void shrinkSendTask(void* arg) {
   }
   j->tSendDone = millis();
   j->sendExited = true;
-  vTaskDelete(nullptr);
+  vTaskSuspend(nullptr);                                  // the parent deletes it (frees the stack properly)
 }
 
 static void shrinkFinalizeUntil(ShrinkJob* j, int limit) {
@@ -2044,19 +2054,20 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
     if (j->sink) {                                        // sender first, so it's there when the first band is encoded
       j->outReady = xSemaphoreCreateBinary();
       j->sendExited = false;
-      sendStarted = j->outReady && xTaskCreatePinnedToCoreWithCaps(shrinkSendTask, "send", 6144, j, 1, nullptr, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+      sendStarted = j->outReady && xTaskCreatePinnedToCoreWithCaps(shrinkSendTask, "send", 6144, j, 1, &j->sendTaskH, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
       if (!sendStarted) { j->sendExited = true; }
     }
     // encoder on the other core; a stack in internal RAM if there's room, else external
     if (!j->sink || sendStarted) {
+      j->encCaps = false;
       encStarted = xTaskCreatePinnedToCore(shrinkEncTask, "encode", 10240, j, 2, &j->encTaskH, 0) == pdPASS;
-      if (!encStarted) encStarted = xTaskCreatePinnedToCoreWithCaps(shrinkEncTask, "encode", 10240, j, 2, &j->encTaskH, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+      if (!encStarted) { j->encCaps = true; encStarted = xTaskCreatePinnedToCoreWithCaps(shrinkEncTask, "encode", 10240, j, 2, &j->encTaskH, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS; }
     }
   }
   if (!encStarted) {
     blog("Fast resizer: not enough memory (largest free PSRAM block %u KB, internal %u KB)", (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
          (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
-    if (sendStarted) { j->encExited = true; j->encFail = true; xSemaphoreGive(j->outReady); while (!j->sendExited) delay(1); }
+    if (sendStarted) { j->encExited = true; j->encFail = true; xSemaphoreGive(j->outReady); while (!j->sendExited) delay(1); reapTask(j->sendTaskH, true); }
     if (j->outReady) { vSemaphoreDelete(j->outReady); j->outReady = nullptr; }
     shrinkFreeWork(j); shrinkFreeBands(j); free(j->out); j->out = nullptr; j->outCap = 0; j->enc = nullptr; j->bandOut = nullptr;
     delete enc; free(blk); jpeg_dec_close(dec); return false;
@@ -2083,6 +2094,8 @@ static bool shrinkFast(ShrinkJob* j, uint32_t t0) {
   while (j->bandCount < j->bandsTotal) { j->encFail = true; xSemaphoreGive(j->bandFull[(j->bandCount++) & 1]); }
   while (!j->encExited) delay(1);
   while (!j->sendExited) delay(1);                      // the sender finishes handing the last bytes to the printer
+  reapTask(j->encTaskH, j->encCaps);
+  reapTask(j->sendTaskH, true);
   if (j->outReady) { vSemaphoreDelete(j->outReady); j->outReady = nullptr; }
   ok = ok && !j->encFail && !j->sinkFail && j->outLen > 0;
   j->tDec = tResDone - t1;                              // decode+resize wall time (encoding and sending ran alongside)
@@ -2307,7 +2320,7 @@ static void shrinkTaskFn(void* arg) {
   ShrinkJob* j = (ShrinkJob*)arg;
   shrinkRun(j);
   xTaskNotifyGive(j->waiter);
-  vTaskDelete(nullptr);
+  vTaskSuspend(nullptr);                                  // shrinkBlocking deletes it
 }
 
 static SemaphoreHandle_t shrinkMtx = nullptr;
@@ -2315,10 +2328,13 @@ static void shrinkBlocking(ShrinkJob* j) {
   if (!shrinkMtx) shrinkMtx = xSemaphoreCreateMutex();
   xSemaphoreTake(shrinkMtx, portMAX_DELAY);              // one photo at a time (shared accumulators)
   j->waiter = xTaskGetCurrentTaskHandle();
-  if (xTaskCreatePinnedToCore(shrinkTaskFn, "shrink", 32768, j, 1, nullptr, 1) != pdPASS) {
+  // Its stack is big (decoder + encoder), so it comes from PSRAM: internal RAM is too fragmented for 32 KB in one piece.
+  TaskHandle_t h = nullptr;
+  if (xTaskCreatePinnedToCoreWithCaps(shrinkTaskFn, "shrink", 32768, j, 1, &h, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
     j->result = 0; j->why = "no memory to start the resizer"; xSemaphoreGive(shrinkMtx); return;
   }
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  reapTask(h, true);
   xSemaphoreGive(shrinkMtx);
 }
 
@@ -3685,6 +3701,18 @@ void loop() {
   if (saveWm) { saveWm = false; prefs.putBool("wm", wmOn); blog("Corner text %s", wmOn ? "on" : "off"); }
   serviceBootButton();
   persistStep();
+  // The printer stopped taking data (asleep, switched off, cable bumped): restart the USB port once a
+  // minute at most, so it reconnects by itself when the printer is back instead of needing a replug.
+  {
+    static uint32_t lastPortReset = 0;
+    if (uOutStuck && usbHostStarted && (lastPortReset == 0 || millis() - lastPortReset > 60000)) {
+      lastPortReset = millis();
+      blog("USB: printer stopped answering - restarting the USB port (turn the printer on if it's off)");
+      usb_host_lib_set_root_port_power(false);
+      delay(800);
+      usb_host_lib_set_root_port_power(true);
+    }
+  }
   if (otaRequested) { delay(500); runOnlineUpdate(); }
   if (saveColor) { saveColor = false; buildColor(); prefs.putInt("cwarm", colWarm); prefs.putInt("ccon", colCon); prefs.putInt("csat", colSat); }
   if (scrLogAct) { int a = scrLogAct; scrLogAct = 0;
