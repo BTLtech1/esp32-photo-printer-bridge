@@ -56,7 +56,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.9.7"
+#define FW_VERSION    "0.9.8"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -96,7 +96,7 @@ volatile bool saveWm = false;             // corner text turned on/off from the 
 volatile int  scrLogAct = 0;              // counter reset from the screen, logged from loop()
 char lastPhotoName[40] = "", lastPhotoInfo[40] = "";
 uint32_t storStartMs = 0;
-#define notePhoto(nm, fmt, ...) do { strlcpy(lastPhotoName, (nm), sizeof(lastPhotoName)); \
+#define notePhoto(nm, fmt, ...) do { markRecent(String(nm)); strlcpy(lastPhotoName, (nm), sizeof(lastPhotoName)); \
   snprintf(lastPhotoInfo, sizeof(lastPhotoInfo), fmt, ##__VA_ARGS__); } while (0)
 // The SELPHY doesn't report how much ink is left, so the bridge counts its own prints.
 int    paperCap  = 18;       // sheets loaded in the paper tray (the CP1500 tray holds 18)
@@ -113,6 +113,7 @@ int    thermTone   = 0;            // -3 lighter .. +3 darker
 int    labelW10    = 40;           // label width, tenths of an inch (receipts: paper's printable width)
 int    labelH10    = 60;           // label length, tenths of an inch
 int    thermDpi    = 203;
+bool   skipResend  = true;         // the camera sends the same photo again within 3 minutes: don't print it twice
 bool   screenForce = false;        // start the screen even if it doesn't answer the ID check
 String pagePass    = "";           // password for the bridge's page (user name "btl"); empty = no password
 bool   ffatOk      = false;        // flash storage for the waiting photos is mounted
@@ -334,6 +335,24 @@ static size_t spoolLimit() {
 static size_t queueLen() {
   xSemaphoreTake(dataMtx, portMAX_DELAY); size_t n = jobs.size(); xSemaphoreGive(dataMtx); return n;
 }
+// Photos accepted in the last few minutes (name, time), to spot the camera re-sending one after a
+// dropped connection or being switched off before it heard "done".
+struct RecentPhoto { String name; uint32_t at; };
+static std::vector<RecentPhoto> recentPhotos;
+static void markRecent(const String& n) {
+  xSemaphoreTake(dataMtx, portMAX_DELAY);
+  recentPhotos.push_back({ n, millis() });
+  if (recentPhotos.size() > 20) recentPhotos.erase(recentPhotos.begin());
+  xSemaphoreGive(dataMtx);
+}
+static bool sentRecently(const String& n) {
+  bool f = false;
+  xSemaphoreTake(dataMtx, portMAX_DELAY);
+  for (auto& r : recentPhotos) if (r.name == n && millis() - r.at < 180000) { f = true; break; }
+  xSemaphoreGive(dataMtx);
+  return f;
+}
+
 static void addPrinted(const String& n) {
   xSemaphoreTake(dataMtx, portMAX_DELAY);
   printedNames.push_back(n);
@@ -1242,7 +1261,9 @@ static bool discoverPrinter() {
 // =============================================================== print queue task
 static bool retryable(uint16_t st) { return st == 0x0506 || st == 0x0507 || st == 0xFFFE; }
 
+static void markRecent(const String& n);
 static void enqueueJob(uint8_t* data, size_t len, const String& name, int rating) {
+  markRecent(name);
   xSemaphoreTake(dataMtx, portMAX_DELAY);
   jobs.push_back({ data, len, name, rating, 0, nextJobId++, false });
   xSemaphoreGive(dataMtx);
@@ -2576,6 +2597,15 @@ static String ftpStor(Client& d, const String& path) {
     }
   }
 
+  // 2a. The camera sent this same photo again a moment ago (it re-sends after a dropped connection,
+  //     or after being switched off before it heard "done"): don't print it twice.
+  if (skipResend && sentRecently(name)) {
+    if (!eof) drain(d);
+    free(hb);
+    blog("%s came again within 3 minutes - the camera re-sent it, so it's not printed twice (Print settings to change)", name.c_str());
+    return "226 Transfer complete";
+  }
+
   // 2b. Which printer: star ratings (3 = label, 4 = SELPHY, 5 = both) or the default.
   int dest = printDest(rating);
   bool selphyOk = usbIppReady() || printerFound;
@@ -2927,6 +2957,9 @@ static void handleRoot() {
        String("<option value=0") + (wmMargin10 == 0 ? " selected" : "") + ">None: right in the corner</option>" +
        String("<option value=10") + (wmMargin10 == 10 ? " selected" : "") + ">Small (if borderless trims the text)</option>" +
        String("<option value=30") + (wmMargin10 == 30 ? " selected" : "") + ">Medium</option></select></label>"
+       "<label><input type=checkbox name=skipre";
+  if (skipResend) h += " checked";
+  h += "> Don't print the same photo twice within 3 minutes <span class=mut>(the camera re-sends a photo after its Wi-Fi drops or it's switched off mid-send)</span></label>"
        "<label><input type=checkbox name=shrink";
   if (shrinkOn) h += " checked";
   h += "> Shrink photos to print size first <span class=mut>(prints much sooner; still the printer's full 300 dpi)</span></label>"
@@ -3377,6 +3410,7 @@ static void handleSettings() {
   if (server.arg("fuser").length()) ftpUser = server.arg("fuser");
   if (server.arg("fpass").length()) ftpPass = server.arg("fpass");
   shrinkOn = server.hasArg("shrink");
+  skipResend = server.hasArg("skipre"); prefs.putBool("skipre", skipResend);
   wmOn = server.hasArg("wm");
   wmText = server.arg("wmt"); wmText.trim(); if (wmText.length() > 40) wmText = wmText.substring(0, 40);
   wmMargin10 = constrain((int)server.arg("wmm").toInt(), 0, 50);
@@ -3599,6 +3633,7 @@ void setup() {
   routeStars = prefs.getBool("route", true); defaultDest = prefs.getInt("dest", DEST_SELPHY); labelFwd = prefs.getBool("lfwd", true);
   minRating = prefs.getInt("minr", 3);
   shrinkOn = prefs.getBool("shrink", true);
+  skipResend = prefs.getBool("skipre", true);
   wmOn = prefs.getBool("wm", false); wmText = prefs.getString("wmt", ""); wmMargin10 = prefs.getInt("wmm", 0);
   fillOn = prefs.getBool("fill", true);
   apOn = prefs.getBool("apon", true);
@@ -3717,9 +3752,14 @@ void loop() {
   // minute at most, so it reconnects by itself when the printer is back instead of needing a replug.
   {
     static uint32_t lastPortReset = 0;
-    if (uOutStuck && usbHostStarted && (lastPortReset == 0 || millis() - lastPortReset > 60000)) {
-      lastPortReset = millis();
-      blog("USB: printer stopped answering - restarting the USB port (turn the printer on if it's off)");
+    static uint32_t sensedSince = 0;
+    bool sensedIdle = usbHostStarted && !uReady && !uLabel && (*(volatile uint32_t*)BTL_HPRT & 1);   // plugged in, never came up
+    if (!sensedIdle) sensedSince = 0; else if (!sensedSince) sensedSince = millis();
+    bool stuckAtStart = sensedSince && millis() - sensedSince > 12000;
+    if ((uOutStuck || stuckAtStart) && usbHostStarted && (lastPortReset == 0 || millis() - lastPortReset > 60000)) {
+      lastPortReset = millis(); sensedSince = 0;
+      blog(uOutStuck ? "USB: printer stopped answering - restarting the USB port (turn the printer on if it's off)"
+                     : "USB: printer is plugged in but didn't connect - restarting the USB port");
       usb_host_lib_set_root_port_power(false);
       delay(800);
       usb_host_lib_set_root_port_power(true);
