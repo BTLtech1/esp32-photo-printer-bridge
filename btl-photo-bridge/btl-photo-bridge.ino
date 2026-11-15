@@ -3050,8 +3050,20 @@ static void handleRoot() {
     h += "<form method=post action=/onlineupdate style='display:inline'><button>Install " + esc(latestVersion) + "</button></form>";
   else if (latestVersion.length()) h += "<span class=mut>Up to date.</span>";
   h += "<div class=mut style='margin:6px 0 10px'>Needs home Wi-Fi with internet. Settings, counters and waiting photos are kept.</div>"
-       "<form method=post action=/update enctype=multipart/form-data>"
-       "<label>Or upload the firmware file <input type=file name=f accept='.bin'></label><button>Upload and install</button>"
+       "<form method=post action=/update enctype=multipart/form-data onsubmit='return upFw(this)'>"
+       "<label>Or upload the firmware file <input type=file name=f accept='.bin'></label><button id=fwb>Upload and install</button>"
+       "<div id=fwp style='margin-top:8px;display:none'><div style='height:10px;background:#333;border-radius:5px;overflow:hidden'>"
+       "<div id=fwbar style='height:100%;width:0;background:#f5b400'></div></div><div id=fwt class=mut style='margin-top:4px'></div></div>"
+       "<script>function upFw(f){var file=f.f.files[0],t=document.getElementById('fwt');"
+       "if(!file){alert('Choose the firmware file first.');return false}"
+       "if(!/\\.bin$/.test(file.name)||/-full\\.bin$/.test(file.name)){alert('Pick the btl-photo-bridge-x.y.z.bin file (not -full.bin).');return false}"
+       "document.getElementById('fwp').style.display='block';var b=document.getElementById('fwb');b.disabled=true;b.textContent='Uploading...';"
+       "var x=new XMLHttpRequest();x.open('POST','/update');"
+       "x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded*100/e.total);"
+       "document.getElementById('fwbar').style.width=p+'%';t.textContent=p<100?'Uploading '+p+'% - keep this page open':'Installing...';}};"
+       "x.onload=function(){document.open();document.write(x.responseText);document.close();};"
+       "x.onerror=function(){t.textContent='Upload failed - check the Wi-Fi connection and try again.';b.disabled=false;b.textContent='Upload and install';};"
+       "x.send(new FormData(f));return false}</script>"
        "<div class=mut>No internet (in the field)? Download <b>btl-photo-bridge-x.y.z.bin</b> from the install page's firmware folder beforehand, "
        "then upload it here from your phone on " + esc(apSsid) + ". Not the -full.bin file.</div></form></details></div>";
 
