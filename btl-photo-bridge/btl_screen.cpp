@@ -450,6 +450,7 @@ void screenRecalibrate() { calReq = true; }
 
 uint32_t screenDiagId = 0;
 uint8_t screenDiagStatus = 0;
+uint16_t screenDiagTouch = 0;
 
 bool screenBegin(bool force) {
   pinMode(SCR_PIN_CS, OUTPUT); digitalWrite(SCR_PIN_CS, HIGH);
@@ -472,7 +473,22 @@ bool screenBegin(bool force) {
     csLcd(false); spi->endTransaction();
     screenDiagStatus = pm;
     // expect booster on, awake, normal mode, display on
-    if (!force && (pm == 0xFF || (pm & 0x9C) != 0x9C)) { spi->end(); delete spi; spi = nullptr; present = false; return false; }
+    bool lcdAnswered = pm != 0xFF && (pm & 0x9C) == 0x9C;
+    // Many of these screens never drive their SDO line, so ask the touch chip instead: its temperature
+    // reading comes back mid-range when it's there, and as zeros (pulled down) when nothing is connected.
+    bool touchAnswered = false;
+    if (!lcdAnswered) {
+      spi->beginTransaction(SPISettings(SPI_HZ_TOUCH, MSBFIRST, SPI_MODE0));
+      csTouch(true);
+      tRead(0x84);                                     // first reading after switching is noisy
+      uint16_t t = tRead(0x84);
+      tRead(0x80); spi->transfer(0); spi->transfer(0); // back to pen-interrupt mode
+      csTouch(false);
+      spi->endTransaction();
+      screenDiagTouch = t;
+      touchAnswered = t > 100 && t < 4000;
+    }
+    if (!force && !lcdAnswered && !touchAnswered) { spi->end(); delete spi; spi = nullptr; present = false; return false; }
   }
   fb = (uint16_t*)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   thPend = (uint16_t*)heap_caps_malloc(TW * TW * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

@@ -50,6 +50,7 @@ bool screenBegin(bool force = false);
 // What the screen answered when asked for its ID and power status (for the log).
 extern uint32_t screenDiagId;
 extern uint8_t screenDiagStatus;
+extern uint16_t screenDiagTouch;   // touch chip's reading, used when the screen itself doesn't answer
 bool screenPresent();
 // Wakes the backlight (e.g. a photo arrived).
 void screenWake();

@@ -56,7 +56,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.9.5"
+#define FW_VERSION    "0.9.6"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -3613,10 +3613,13 @@ void setup() {
   restoreJobs();
   screenForce = prefs.getBool("scrforce", false);
   if (screenBegin(screenForce))
-    blog("Screen: %s (ID %06X, status %02X)", (screenDiagId & 0xFFFF) == 0x9341 ? "2.8\" touchscreen found" : "started without an ID answer (always-start is on)",
-         (unsigned)screenDiagId, screenDiagStatus);
-  else blog("Screen: no answer (ID %06X, status %02X) - check its wiring, or turn on 'Always start the screen' if it's connected",
-            (unsigned)screenDiagId, screenDiagStatus);
+    blog("Screen: %s (ID %06X, status %02X, touch %u)",
+         (screenDiagId & 0xFFFF) == 0x9341 || (screenDiagStatus & 0x9C) == 0x9C ? "2.8\" touchscreen found"
+         : (screenDiagTouch > 100 && screenDiagTouch < 4000) ? "2.8\" touchscreen found (via its touch chip)"
+         : "started without an answer (always-start is on)",
+         (unsigned)screenDiagId, screenDiagStatus, screenDiagTouch);
+  else blog("Screen: no answer (ID %06X, status %02X, touch %u) - check its wiring, or turn on 'Always start the screen' if it's connected",
+            (unsigned)screenDiagId, screenDiagStatus, screenDiagTouch);
   if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
   if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s, %u KB internal RAM free, resizer buffers %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF",
                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), resSums ? "reserved" : "NOT reserved");
