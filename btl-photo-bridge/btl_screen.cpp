@@ -448,7 +448,10 @@ bool screenPresent() { return present; }
 void screenWake() { wakeReq = true; }
 void screenRecalibrate() { calReq = true; }
 
-bool screenBegin() {
+uint32_t screenDiagId = 0;
+uint8_t screenDiagStatus = 0;
+
+bool screenBegin(bool force) {
   pinMode(SCR_PIN_CS, OUTPUT); digitalWrite(SCR_PIN_CS, HIGH);
   pinMode(SCR_PIN_TCS, OUTPUT); digitalWrite(SCR_PIN_TCS, HIGH);
   pinMode(SCR_PIN_DC, OUTPUT); pinMode(SCR_PIN_RST, OUTPUT);
@@ -460,14 +463,16 @@ bool screenBegin() {
   gpio_pullup_dis((gpio_num_t)SCR_PIN_MISO); gpio_pulldown_en((gpio_num_t)SCR_PIN_MISO);   // after begin(), which resets the pin
   lcdInit(0x28);                                      // landscape
   uint32_t id = lcdReadId();
+  screenDiagId = id;
   if ((id & 0xFFFF) != 0x9341) {                       // some clones don't answer the ID read: try the status read
     lcdCmd(0x00);
     spi->beginTransaction(SPISettings(SPI_HZ_READ, MSBFIRST, SPI_MODE0));
     csLcd(true); digitalWrite(SCR_PIN_DC, LOW); spi->transfer(0x0A); digitalWrite(SCR_PIN_DC, HIGH);
     spi->transfer(0); uint8_t pm = spi->transfer(0);   // power mode: 0x9C when on and awake
     csLcd(false); spi->endTransaction();
+    screenDiagStatus = pm;
     // expect booster on, awake, normal mode, display on
-    if (pm == 0xFF || (pm & 0x9C) != 0x9C) { spi->end(); delete spi; spi = nullptr; present = false; return false; }
+    if (!force && (pm == 0xFF || (pm & 0x9C) != 0x9C)) { spi->end(); delete spi; spi = nullptr; present = false; return false; }
   }
   fb = (uint16_t*)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   thPend = (uint16_t*)heap_caps_malloc(TW * TW * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

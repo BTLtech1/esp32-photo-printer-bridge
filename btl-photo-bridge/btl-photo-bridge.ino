@@ -56,7 +56,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.9.4"
+#define FW_VERSION    "0.9.5"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -113,6 +113,7 @@ int    thermTone   = 0;            // -3 lighter .. +3 darker
 int    labelW10    = 40;           // label width, tenths of an inch (receipts: paper's printable width)
 int    labelH10    = 60;           // label length, tenths of an inch
 int    thermDpi    = 203;
+bool   screenForce = false;        // start the screen even if it doesn't answer the ID check
 String pagePass    = "";           // password for the bridge's page (user name "btl"); empty = no password
 bool   ffatOk      = false;        // flash storage for the waiting photos is mounted
 uint32_t nextJobId = 1;
@@ -2877,6 +2878,9 @@ static void handleRoot() {
        "<form method=post action=/usbreset><button>Restart the USB port</button></form>"
        "<div class=mut style='margin-top:6px'><a style='color:inherit' href=/usbdiag>USB diagnostics</a> &middot; <a style='color:inherit' href=/printerinfo>Printer details</a></div>";
   if (screenPresent()) h += "<form method=post action=/screencal style='margin-top:8px'><button>Redo screen touch setup</button></form>";
+  h += "<form method=post action=/screenforce style='margin-top:8px'><label><input type=checkbox name=on onchange='this.form.submit()'";
+  if (screenForce) h += " checked";
+  h += "> Always start the screen <span class=mut>(for screens that don't answer the startup check; restarts the bridge)</span></label></form>";
   h += "</div>";
 
   h += "<div class=card><h2>Activity</h2><pre id=log>&hellip;</pre></div>";
@@ -3607,8 +3611,12 @@ void setup() {
 
   persistMtx = xSemaphoreCreateMutex();
   restoreJobs();
-  if (screenBegin()) blog("Screen: 2.8\" touchscreen found");
-  else blog("Screen: none connected");
+  screenForce = prefs.getBool("scrforce", false);
+  if (screenBegin(screenForce))
+    blog("Screen: %s (ID %06X, status %02X)", (screenDiagId & 0xFFFF) == 0x9341 ? "2.8\" touchscreen found" : "started without an ID answer (always-start is on)",
+         (unsigned)screenDiagId, screenDiagStatus);
+  else blog("Screen: no answer (ID %06X, status %02X) - check its wiring, or turn on 'Always start the screen' if it's connected",
+            (unsigned)screenDiagId, screenDiagStatus);
   if (apOn) blog("Camera network %s: address %s", apSsid.c_str(), AP_IP.toString().c_str());
   if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s, %u KB internal RAM free, resizer buffers %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF",
                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), resSums ? "reserved" : "NOT reserved");
@@ -3650,6 +3658,12 @@ void setup() {
   server.on("/preview", HTTP_POST, []() { if (authOrAsk()) handlePreviewDone(); }, handleTestUpload);
   server.on("/savewifi", HTTP_POST, []() { if (authOrAsk()) handleSaveWifi(); });
   server.on("/apsettings", HTTP_POST, []() { if (authOrAsk()) handleApSettings(); });
+  server.on("/screenforce", HTTP_POST, []() {
+    if (!authOrAsk()) return;
+    screenForce = server.hasArg("on"); prefs.putBool("scrforce", screenForce);
+    blog("Screen: always-start %s - restarting", screenForce ? "on" : "off");
+    redirectHome(); restartAt = millis() + 1500;
+  });
   server.on("/security", HTTP_POST, []() { if (authOrAsk()) handleSecurity(); });
   server.on("/checkupdate", HTTP_POST, []() { if (authOrAsk()) handleCheckUpdate(); });
   server.on("/onlineupdate", HTTP_POST, []() { if (authOrAsk()) handleOnlineUpdate(); });

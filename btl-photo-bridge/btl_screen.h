@@ -45,8 +45,11 @@ enum { SCR_ACT_WARM = 1, SCR_ACT_CON, SCR_ACT_SAT, SCR_ACT_NEW_INK, SCR_ACT_PAPE
 void screenGetInfo(ScreenInfo& s);
 void screenAction(int action, int value);
 
-// Starts the screen task. Returns true if a screen answered.
-bool screenBegin();
+// Starts the screen task. Returns true if a screen answered (or force is set: start it anyway).
+bool screenBegin(bool force = false);
+// What the screen answered when asked for its ID and power status (for the log).
+extern uint32_t screenDiagId;
+extern uint8_t screenDiagStatus;
 bool screenPresent();
 // Wakes the backlight (e.g. a photo arrived).
 void screenWake();
