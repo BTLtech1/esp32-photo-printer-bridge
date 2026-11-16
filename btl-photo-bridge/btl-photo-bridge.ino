@@ -57,7 +57,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.10.0"
+#define FW_VERSION    "0.10.1"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -2969,7 +2969,7 @@ static void handleRoot() {
        "<label><input type=checkbox name=wm";
   if (wmOn) h += " checked";
   h += "> Put this in the corner of prints: <input name=wmt maxlength=40 style='width:14em' placeholder='yourwebsite.com' value='" + esc(wmText) + "'> "
-       "<span class=mut>(white with a black outline, bottom right; the board's BOOT button turns it on/off)</span></label>"
+       "<span class=mut>(white with a black outline, bottom right; two clicks of the board's BOOT button turn it on/off)</span></label>"
        "<label>Gap from the corner <select name=wmm>" +
        String("<option value=0") + (wmMargin10 == 0 ? " selected" : "") + ">None: right in the corner</option>" +
        String("<option value=10") + (wmMargin10 == 10 ? " selected" : "") + ">Small (if borderless trims the text)</option>" +
@@ -3600,13 +3600,50 @@ static void bootMark(const char* what) {         // progress markers in Serial M
   Serial.flush();
 }
 
-// ---- the board's BOOT button: 1 click = corner text on/off, 2 clicks = next default printer.
-// The board's color light answers: green/red = text on/off; blue/yellow/purple = SELPHY/label/both.
+// ---- the board's BOOT button: 1 click = show ink and paper left, 2 clicks = corner text on/off,
+// 3 clicks = next default printer. The board's color light answers:
+//   1 click: green / yellow / red = plenty / getting low / nearly out, then the ink count in blue
+//            (long blinks = tens, short = ones, a flicker = zero), then the paper count in white.
+//   2 clicks: green/red = text on/off.   3 clicks: blue/yellow/purple = SELPHY/label/both.
 static const uint8_t ledPins[] = { 48, 38 };          // the color LED is on 48 or 38 depending on the board version
 static uint32_t ledOffAt = 0;
+struct LedStep { uint8_t r, g, b; uint16_t ms; };
+static LedStep ledSeq[140]; static int ledSeqLen = 0, ledSeqPos = 0; static uint32_t ledSeqNext = 0;
 static void ledFlash(uint8_t r, uint8_t g, uint8_t b, uint32_t ms) {
+  ledSeqLen = 0;                                        // a flash replaces any blink count in progress
   for (uint8_t pin : ledPins) rgbLedWrite(pin, r, g, b);
   ledOffAt = millis() + ms;
+}
+static void seqAdd(uint8_t r, uint8_t g, uint8_t b, uint16_t ms) {
+  if (ledSeqLen < (int)(sizeof(ledSeq) / sizeof(ledSeq[0]))) ledSeq[ledSeqLen++] = { r, g, b, ms };
+}
+static void seqNumber(int n, uint8_t r, uint8_t g, uint8_t b) {   // long blinks = tens, short = ones, flicker = zero
+  if (n < 0) n = 0;
+  int tens = n / 10, ones = n % 10;
+  for (int i = 0; i < tens; i++) { seqAdd(r, g, b, 600); seqAdd(0, 0, 0, 300); }
+  if (tens) seqAdd(0, 0, 0, 500);
+  if (!ones) { seqAdd(r, g, b, 60); seqAdd(0, 0, 0, 300); }
+  for (int i = 0; i < ones; i++) { seqAdd(r, g, b, 180); seqAdd(0, 0, 0, 320); }
+}
+static void showLevels() {
+  int ink = printsLeft(), paper = paperLeft();
+  ledOffAt = 0; ledSeqLen = 0;
+  if (ink < 5 || paper < 2) seqAdd(60, 0, 0, 1200);            // nearly out
+  else if (ink < 20 || paper < 6) seqAdd(50, 35, 0, 1200);     // getting low
+  else seqAdd(0, 50, 0, 1200);                                 // plenty
+  seqAdd(0, 0, 0, 900);
+  seqNumber(ink, 0, 0, 60);                                    // ink: blue
+  seqAdd(0, 0, 0, 1300);
+  seqNumber(paper, 40, 40, 40);                                // paper: white
+  ledSeqPos = 0; ledSeqNext = millis();
+  blog("BOOT button: %d prints of ink and %d sheets of paper left", ink, paper);
+}
+static void serviceLedSeq(uint32_t now) {
+  if (!ledSeqLen || (int32_t)(now - ledSeqNext) < 0) return;
+  if (ledSeqPos >= ledSeqLen) { ledSeqLen = 0; for (uint8_t pin : ledPins) rgbLedWrite(pin, 0, 0, 0); return; }
+  const LedStep& st = ledSeq[ledSeqPos++];
+  for (uint8_t pin : ledPins) rgbLedWrite(pin, st.r, st.g, st.b);
+  ledSeqNext = now + st.ms;
 }
 static void serviceBootButton() {
   static bool was = false; static uint32_t downAt = 0, lastUp = 0; static int clicks = 0;
@@ -3623,7 +3660,8 @@ static void serviceBootButton() {
   if (!down && was && now - downAt > 30 && !longDone) { clicks++; lastUp = now; }
   was = down;
   if (clicks && !down && now - lastUp > 450) {           // the click series is over
-    if (clicks == 1) {
+    if (clicks == 1) showLevels();
+    else if (clicks == 2) {
       if (!wmText.length()) { blog("BOOT button: no corner text set yet (Print settings)"); ledFlash(40, 0, 0, 300); }
       else { wmOn = !wmOn; saveWm = true; ledFlash(wmOn ? 0 : 40, wmOn ? 40 : 0, 0, 1200); }
     } else {
@@ -3636,6 +3674,7 @@ static void serviceBootButton() {
     clicks = 0;
   }
   if (ledOffAt && (int32_t)(now - ledOffAt) >= 0) { for (uint8_t pin : ledPins) rgbLedWrite(pin, 0, 0, 0); ledOffAt = 0; }
+  serviceLedSeq(now);
 }
 
 void setup() {
