@@ -57,7 +57,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.10.3"
+#define FW_VERSION    "0.10.4"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -150,6 +150,7 @@ String ftpUser   = "btl";
 String ftpPass   = "print";
 bool   apOn   = true;                 // the bridge's own Wi-Fi network for the camera
 String apSsid = "BTL-Photo", apPass = "printphoto";
+String hostName = HOSTNAME;         // "btl-photo", or "btl-photo-xxxx" on boards first set up with v0.10.4 or later
 static const IPAddress AP_IP(192, 168, 4, 1);
 
 // ---- printer
@@ -2910,7 +2911,7 @@ static void handleRoot() {
   h += PAGE_STYLE;
   h += "</head><body><h1>BTL Photo Printer Bridge</h1><div class=mut>v" FW_VERSION;
   if (apOn) h += " &middot; camera network <b>" + esc(apSsid) + "</b>: " + AP_IP.toString();
-  h += " &middot; home Wi-Fi: " + ip + "</div>";
+  h += " &middot; home Wi-Fi: " + ip + " (http://" + hostName + ".local)</div>";
 
   if (apOn && apPass == "printphoto" && ftpPass == "print")
     h += "<div class='card warn'>Still using the default passwords (<b>printphoto</b> for " + esc(apSsid) + ", <b>print</b> for the camera login), "
@@ -3532,10 +3533,16 @@ static void handleSaveWifi() {
   String s = server.arg("ssid"), p = server.arg("pass");
   if (!s.length()) { server.send(400, "text/plain", "Wi-Fi name is required"); return; }
   prefs.putString("ssid", s); prefs.putString("pass", p);
-  server.send(200, "text/html",
-    "<meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<body style='font-family:sans-serif;background:#111;color:#eee;padding:16px'><h2>Saved - restarting</h2>"
-    "<p>Open <b>http://btl-photo.local</b> from your home Wi-Fi in about a minute (or http://192.168.4.1 from the camera network).</p>");
+  String h = "<meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:sans-serif;background:#111;color:#eee;padding:16px;line-height:1.5'><h2>Saved. The bridge is restarting to join " + esc(s) + "</h2>"
+    "<p><b>This page will stop responding</b>, and your phone or computer may drop off the bridge's network. That's expected.</p>"
+    "<p>In about a minute, open the bridge's page again one of these ways:</p><ul>"
+    "<li>On your <b>home Wi-Fi</b>: <a style='color:#8cf' href='http://" + hostName + ".local'>http://" + hostName + ".local</a></li>";
+  if (apOn) h += "<li>Or rejoin the bridge's network <b>" + esc(apSsid) + "</b> and open <a style='color:#8cf' href='http://" + AP_IP.toString() + "'>http://" + AP_IP.toString() + "</a></li>";
+  h += "</ul><p>If the Wi-Fi name or password was wrong, the bridge can't join it";
+  if (apOn) h += ": rejoin <b>" + esc(apSsid) + "</b> and enter it again";
+  h += ".</p>";
+  server.send(200, "text/html", h);
   delay(1500);
   ESP.restart();
 }
@@ -3702,7 +3709,19 @@ void setup() {
   wmOn = prefs.getBool("wm", false); wmText = prefs.getString("wmt", ""); wmMargin10 = prefs.getInt("wmm", 0);
   fillOn = prefs.getBool("fill", true);
   apOn = prefs.getBool("apon", true);
-  apSsid = prefs.getString("apssid", "BTL-Photo");
+  // Each new board gets its own names (BTL-Photo-A1B2, btl-photo-a1b2.local) so two bridges don't collide.
+  // A board that was already set up keeps "BTL-Photo" and "btl-photo", so the camera's saved connection still works.
+  if (!prefs.isKey("uniq")) {
+    bool existing = prefs.isKey("ssid") || prefs.isKey("apssid") || prefs.isKey("cused") || prefs.isKey("mode") || prefs.isKey("scrseen");
+    prefs.putBool("uniq", !existing);
+  }
+  String apDefault = "BTL-Photo";
+  if (prefs.getBool("uniq", false)) {
+    char id[8]; snprintf(id, sizeof(id), "%04x", (unsigned)((ESP.getEfuseMac() >> 32) & 0xFFFF));
+    hostName = String(HOSTNAME) + "-" + id;
+    String up = id; up.toUpperCase(); apDefault += "-" + up;
+  }
+  apSsid = prefs.getString("apssid", apDefault);
   apPass = prefs.getString("appass", "printphoto");
   scaleFill = prefs.getBool("pscale", true);
   dryRun = prefs.getBool("dry", false);
@@ -3728,7 +3747,7 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_INFO);           // chatty until Wi-Fi is up, so boot problems show in Serial Monitor
   usbStart();                                     // before Wi-Fi, same order as the label bridge
   bootMark("USB host starting");
-  WiFi.setHostname(HOSTNAME);
+  WiFi.setHostname(hostName.c_str());
   WiFi.mode(apOn ? WIFI_AP_STA : WIFI_STA);
   WiFi.setSleep(false);
   bootMark("Wi-Fi started");
@@ -3751,7 +3770,7 @@ void setup() {
          (unsigned)screenDiagId, screenDiagStatus, screenDiagTouch);
   if (screenPresent() && !screenSeen && ((screenDiagId & 0xFFFF) == 0x9341 || (screenDiagStatus & 0x9C) == 0x9C ||
       (screenDiagTouch > 100 && screenDiagTouch < 4000))) prefs.putBool("scrseen", true);
-  else blog("Screen: no answer (ID %06X, status %02X, touch %u) - check its wiring, or turn on 'Always start the screen' if it's connected",
+  else if (!screenPresent()) blog("No touchscreen connected (it's optional). If one is wired up but dark: check its wiring, or turn on 'Always start the screen'  (ID %06X, status %02X, touch %u)",
             (unsigned)screenDiagId, screenDiagStatus, screenDiagTouch);
   if (oledOk) blog("Small OLED found on IO4/IO5");
   if (oledOk) oledNote("Ready", wifiOk ? WiFi.localIP().toString().c_str() : AP_IP.toString().c_str(), 3000);
@@ -3759,7 +3778,7 @@ void setup() {
   if (wifiOk) blog("Bridge ready at http://%s  (PSRAM %s, %u KB internal RAM free, resizer buffers %s)", WiFi.localIP().toString().c_str(), psramFound() ? "on" : "OFF",
                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), resSums ? "reserved" : "NOT reserved");
   else blog("Home Wi-Fi not connected - page at http://%s on the camera network  (PSRAM %s)", AP_IP.toString().c_str(), psramFound() ? "on" : "OFF");
-  MDNS.begin(HOSTNAME);
+  MDNS.begin(hostName.c_str());
   MDNS.addService("http", "tcp", 80);
   ftpCtl.begin();
   camData.listen(FTP_PASV_PORT);

@@ -27,11 +27,13 @@ Tested with a **Canon EOS R6 Mark II** and a **Canon SELPHY CP1500**. Other came
 
 Open **https://btltech1.github.io/esp32-photo-printer-bridge** in Chrome or Edge, plug the board's **UART** port into your computer and click **Install**.
 
-The bridge starts its own Wi-Fi network, **BTL-Photo** (password `printphoto`). Its page is at **http://192.168.4.1** on that network, and that's also the address the camera sends to. Nothing else is required for printing over the USB cable.
+The bridge starts its own Wi-Fi network, **BTL-Photo-xxxx** (password `printphoto`; the four characters are different on every board, and boards set up before v0.10.4 are plain **BTL-Photo**). Its page is at **http://192.168.4.1** on that network, and that's also the address the camera sends to. Nothing else is required for printing over the USB cable.
 
-Right after installing, the page also offers to join your home Wi-Fi (2.4 GHz). That's optional: it lets the bridge reach a printer on your Wi-Fi and lets you open its page (**http://btl-photo.local**) from your normal network. Once connected, the installer's dialog shows the bridge's home address next to its name.
+Right after installing, the page also offers to join your home Wi-Fi (2.4 GHz). That's optional: it lets the bridge reach a printer on your Wi-Fi and lets you open its page from your normal network at **http://btl-photo-xxxx.local** (the bridge's page shows its exact name). Once connected, the installer's dialog shows the bridge's home address next to its name.
 
-If the page sits on "Wrapping up" for more than a minute (some USB-serial chips don't let the browser reopen the port straight after flashing), the firmware is already installed: reload the page, click **Install** again, pick the port, and choose **Connect to Wi-Fi**. The bridge also creates a Wi-Fi network called **BTL-Photo-Setup**: join it and go to `http://192.168.4.1` to enter your Wi-Fi there instead.
+When the bridge joins your home Wi-Fi it restarts, and your phone or computer drops off the bridge's own network. To get back to its page, either stay on your home Wi-Fi and use the address above, or rejoin the bridge's network and open `http://192.168.4.1`.
+
+If the page sits on "Wrapping up" for more than a minute (some USB-serial chips don't let the browser reopen the port straight after flashing), the firmware is already installed: reload the page, click **Install** again, pick the port, and choose **Connect to Wi-Fi**. Or join the bridge's own network, open `http://192.168.4.1`, and enter your Wi-Fi under **Home Wi-Fi** there instead.
 
 ## Camera setup (Canon)
 
