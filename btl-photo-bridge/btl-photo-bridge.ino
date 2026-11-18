@@ -57,7 +57,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.10.9"
+#define FW_VERSION    "0.10.8"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -3040,7 +3040,6 @@ static void handleRoot() {
   h += "</td></tr></table>"
        "<form method=post action=/rediscover><button>Search for printer again</button></form>"
        "<form method=post action=/usbcheck><button>Check the printer over USB</button></form>"
-       "<form method=post action=/wifispeed><button>Test Wi-Fi speed to the printer (no paper used)</button></form>"
        "<form method=post action=/usbreset><button>Restart the USB port</button></form>"
        "<div class=mut style='margin-top:6px'><a style='color:inherit' href=/usbdiag>USB diagnostics</a> &middot; <a style='color:inherit' href=/printerinfo>Printer details</a></div>";
   if (screenPresent()) h += "<form method=post action=/screencal style='margin-top:8px'><button>Redo screen touch setup</button></form>";
@@ -3235,49 +3234,6 @@ static void handleRoot() {
 }
 
 // Asks the printer what it is over the USB cable and writes the answer to the activity log.
-// Sends 150 KB of filler to the printer over Wi-Fi inside a harmless status request, to time the link without
-// printing anything. Runs twice: with the Wi-Fi stack's normal 4 packets in flight, then with 16.
-static void wifiSpeedPass(bool wide) {
-  WiFiClient w;
-  bool ok = wide ? netConnect(w, printerIP, printerPort, 4000) : netConnectRaw(w, printerIP, printerPort, 4000);
-  if (!ok) { blog("Wi-Fi speed test: couldn't reach the printer"); return; }
-  w.setNoDelay(true);
-  std::vector<uint8_t> req;
-  ippHeader(req, 0x000B);                                   // Get-Printer-Attributes: the filler after it is ignored
-  putAttr(req, 0x44, "requested-attributes", "printer-state");
-  put8(req, 0x03);
-  sendPostHeaders(w, true, 0);
-  sendChunk(w, req.data(), req.size());
-  const size_t BLK = 16 * 1024, TOTAL = 150 * 1024;
-  uint8_t* b = (uint8_t*)calloc(1, BLK + 16);
-  if (!b) { w.stop(); blog("Wi-Fi speed test: no memory"); return; }
-  int hl = snprintf((char*)b, 12, "%X\r\n", (unsigned)BLK);
-  b[hl + BLK] = '\r'; b[hl + BLK + 1] = '\n';
-  uint32_t t0 = millis(); size_t sent = 0; bool fail = false;
-  while (sent < TOTAL && !fail) { if (writeAll(w, b, hl + BLK + 2)) sent += BLK; else fail = true; }
-  if (!fail) writeAll(w, (const uint8_t*)"0\r\n\r\n", 5);
-  uint32_t t1 = millis();
-  std::vector<uint8_t> body;
-  int code = fail ? 0 : readHttpResponse(w, body);
-  uint32_t t2 = millis();
-  w.stop(); free(b);
-  float secs = (t1 - t0) / 1000.0f;
-  blog("Wi-Fi speed test, %s: %u KB sent in %.1f s (%u KB/s)%s; printer answered %d after %.1f s more",
-       wide ? "NEW way (16 packets in flight)" : "OLD way (4 packets in flight)", (unsigned)(sent / 1024), secs,
-       (unsigned)(secs > 0.01f ? sent / 1024 / secs : 0), fail ? " - the printer stopped taking data early" : "", code, (t2 - t1) / 1000.0f);
-}
-static void handleWifiSpeed() {
-  if (!printerFound) { blog("Wi-Fi speed test: no printer found on Wi-Fi yet"); redirectHome(); return; }
-  if (xSemaphoreTake(printerMtx, pdMS_TO_TICKS(5000)) != pdTRUE) { blog("Wi-Fi speed test: printer busy, try again"); redirectHome(); return; }
-  bool was = curUsb; curUsb = false;
-  wifiSpeedPass(false);
-  delay(500);
-  wifiSpeedPass(true);
-  curUsb = was;
-  xSemaphoreGive(printerMtx);
-  redirectHome();
-}
-
 static void handleUsbCheck() {
   if (uLabel) { blog("USB check: a label printer is connected (%s) - use Print a test label to check it", usbName.c_str()); redirectHome(); return; }
   if (!uReady) { blog("USB check: no printer on the USB port (%s)", getUsbState().c_str()); redirectHome(); return; }
@@ -3953,7 +3909,6 @@ void setup() {
   server.on("/screencal", HTTP_POST, []() { if (!authOrAsk()) return; screenRecalibrate(); blog("Screen: touch setup started - tap the crosses on the screen"); redirectHome(); });
   server.on("/rediscover", HTTP_POST, []() { if (!authOrAsk()) return; printerFound = false; redirectHome(); });
   server.on("/usbcheck", HTTP_POST, []() { if (authOrAsk()) handleUsbCheck(); });
-  server.on("/wifispeed", HTTP_POST, []() { if (authOrAsk()) handleWifiSpeed(); });
   server.on("/usbdiag", HTTP_GET, []() { if (authOrAsk()) server.send(200, "text/plain", usbDiagText()); });
   server.on("/printerinfo", HTTP_GET, []() { if (authOrAsk()) handlePrinterInfo(); });
   server.on("/printerraw", HTTP_GET, []() { if (authOrAsk()) handlePrinterInfoRaw(true); });
