@@ -57,7 +57,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.10.5"
+#define FW_VERSION    "0.10.6"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -3792,6 +3792,21 @@ void setup() {
   if (psramFound()) reserveResampler();            // while internal RAM is still clean
   liveBuf = (uint8_t*)bigAlloc(LIVE_CHUNK + 32);
   bootMark("settings loaded");
+  {                                                       // why the bridge started, in the log (a restart loop shows up here)
+    const char* why = "unknown";
+    switch (esp_reset_reason()) {
+      case ESP_RST_POWERON: why = "power was connected"; break;
+      case ESP_RST_EXT: why = "reset button"; break;
+      case ESP_RST_SW: why = "restarted by the bridge itself (update or a saved setting)"; break;
+      case ESP_RST_PANIC: why = "the bridge CRASHED and restarted"; break;
+      case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT: why = "the bridge FROZE and was restarted"; break;
+      case ESP_RST_BROWNOUT: why = "POWER DIPPED too low (weak USB port, cable or battery)"; break;
+      case ESP_RST_USB: why = "restarted over USB (installer)"; break;
+      default: break;
+    }
+    uint32_t n = prefs.getUInt("boots", 0) + 1; prefs.putUInt("boots", n);
+    blog("Started v" FW_VERSION " - reason: %s (start number %u)", why, (unsigned)n);
+  }
   bool oledOk = oledBegin();                      // early, so the small screen shows something while Wi-Fi starts
   if (oledOk) oledNote("BTL Photo Bridge", "starting...", 25000);
   improv.begin("BTL Photo Printer Bridge", FW_VERSION, "ESP32-S3", improvName, improvConnect);
