@@ -57,7 +57,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.10.7"
+#define FW_VERSION    "0.10.8"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -347,7 +347,34 @@ static void connHelperTask(void* a) {
   xSemaphoreGive(r->done);
   vTaskDelete(nullptr);
 }
+// The Wi-Fi stack only keeps 4 packets (5.7 KB) on their way to the other side at a time. A printer on Wi-Fi
+// answers slowly (it naps between the router's beacons), so a 150 KB print crawled out at ~25 KB/s. This lets
+// one connection keep up to 16 packets in flight, so far fewer back-and-forths are needed.
+extern "C" {
+#include "lwip/priv/sockets_priv.h"
+}
+#include "lwip/api.h"
+#include "lwip/tcp.h"
+#include "lwip/tcpip.h"
+static void widenSendBuffer(WiFiClient& c) {
+  int fd = c.fd();
+  if (fd < 0) return;
+  LOCK_TCPIP_CORE();
+  struct lwip_sock* so = lwip_socket_dbg_get_socket(fd);
+  if (so && so->conn && NETCONNTYPE_GROUP(netconn_type(so->conn)) == NETCONN_TCP && so->conn->pcb.tcp) {
+    struct tcp_pcb* p = so->conn->pcb.tcp;
+    uint32_t want = 16u * tcp_mss(p);
+    if (p->snd_buf < want) p->snd_buf = (tcpwnd_size_t)want;
+  }
+  UNLOCK_TCPIP_CORE();
+}
+static bool netConnectRaw(WiFiClient& c, IPAddress ip, uint16_t port, uint32_t timeoutMs);
 static bool netConnect(WiFiClient& c, IPAddress ip, uint16_t port, uint32_t timeoutMs) {
+  if (!netConnectRaw(c, ip, port, timeoutMs)) return false;
+  widenSendBuffer(c);
+  return true;
+}
+static bool netConnectRaw(WiFiClient& c, IPAddress ip, uint16_t port, uint32_t timeoutMs) {
   if (!esp_ptr_external_ram(esp_cpu_get_sp())) return c.connect(ip, port, timeoutMs);
   ConnReq r = { &c, ip, port, timeoutMs, false, xSemaphoreCreateBinary() };
   if (!r.done) return false;
