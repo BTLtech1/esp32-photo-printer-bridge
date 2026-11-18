@@ -57,7 +57,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.10.1"
+#define FW_VERSION    "0.10.2"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -3602,8 +3602,8 @@ static void bootMark(const char* what) {         // progress markers in Serial M
 
 // ---- the board's BOOT button: 1 click = show ink and paper left, 2 clicks = corner text on/off,
 // 3 clicks = next default printer. The board's color light answers:
-//   1 click: green / yellow / red = plenty / getting low / nearly out, then the ink count in blue
-//            (long blinks = tens, short = ones, a flicker = zero), then the paper count in white.
+//   1 click: the ink count, two white flashes, then the paper count. A count is a color held for 2 s
+//            (red 0-9, orange 10s, yellow 20s, green 30s, cyan 40s, blue 50s, purple 60+), then one blink per unit.
 //   2 clicks: green/red = text on/off.   3 clicks: blue/yellow/purple = SELPHY/label/both.
 static const uint8_t ledPins[] = { 48, 38 };          // the color LED is on 48 or 38 depending on the board version
 static uint32_t ledOffAt = 0;
@@ -3617,24 +3617,25 @@ static void ledFlash(uint8_t r, uint8_t g, uint8_t b, uint32_t ms) {
 static void seqAdd(uint8_t r, uint8_t g, uint8_t b, uint16_t ms) {
   if (ledSeqLen < (int)(sizeof(ledSeq) / sizeof(ledSeq[0]))) ledSeq[ledSeqLen++] = { r, g, b, ms };
 }
-static void seqNumber(int n, uint8_t r, uint8_t g, uint8_t b) {   // long blinks = tens, short = ones, flicker = zero
-  if (n < 0) n = 0;
-  int tens = n / 10, ones = n % 10;
-  for (int i = 0; i < tens; i++) { seqAdd(r, g, b, 600); seqAdd(0, 0, 0, 300); }
-  if (tens) seqAdd(0, 0, 0, 500);
-  if (!ones) { seqAdd(r, g, b, 60); seqAdd(0, 0, 0, 300); }
-  for (int i = 0; i < ones; i++) { seqAdd(r, g, b, 180); seqAdd(0, 0, 0, 320); }
+// A count as one color and some blinks: the color is the tens (red 0-9, orange 10s, yellow 20s, green 30s,
+// cyan 40s, blue 50s, purple 60 and up), held for 2 seconds, then one blink per unit in the same color.
+// 14 = orange for 2 s, then 4 blinks. Blinks come in fives with a short gap, so they're easy to count.
+static void seqCount(int n) {
+  static const uint8_t col[7][3] = { {60, 0, 0}, {60, 14, 0}, {50, 38, 0}, {0, 55, 0}, {0, 45, 45}, {0, 0, 60}, {40, 0, 55} };
+  if (n <= 0) { for (int i = 0; i < 8; i++) { seqAdd(60, 0, 0, 100); seqAdd(0, 0, 0, 100); } return; }   // none left: fast red flicker
+  int tens = n / 10, ones = n % 10; if (tens > 6) { tens = 6; ones = 0; }
+  const uint8_t* c = col[tens];
+  seqAdd(c[0], c[1], c[2], 2000); seqAdd(0, 0, 0, 600);
+  for (int i = 0; i < ones; i++) { seqAdd(c[0], c[1], c[2], 250); seqAdd(0, 0, 0, i == 4 ? 700 : 300); }
 }
 static void showLevels() {
   int ink = printsLeft(), paper = paperLeft();
   ledOffAt = 0; ledSeqLen = 0;
-  if (ink < 5 || paper < 2) seqAdd(60, 0, 0, 1200);            // nearly out
-  else if (ink < 20 || paper < 6) seqAdd(50, 35, 0, 1200);     // getting low
-  else seqAdd(0, 50, 0, 1200);                                 // plenty
-  seqAdd(0, 0, 0, 900);
-  seqNumber(ink, 0, 0, 60);                                    // ink: blue
-  seqAdd(0, 0, 0, 1300);
-  seqNumber(paper, 40, 40, 40);                                // paper: white
+  seqCount(ink);                                               // ink first
+  seqAdd(0, 0, 0, 1000);
+  seqAdd(40, 40, 40, 150); seqAdd(0, 0, 0, 150); seqAdd(40, 40, 40, 150);   // two white flashes: "now paper"
+  seqAdd(0, 0, 0, 1000);
+  seqCount(paper);
   ledSeqPos = 0; ledSeqNext = millis();
   blog("BOOT button: %d prints of ink and %d sheets of paper left", ink, paper);
 }

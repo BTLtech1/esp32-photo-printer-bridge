@@ -97,7 +97,7 @@ Turn on **Put this in the corner of prints** in Print settings and type your web
 
 Turn it on and off without the page:
 
-- **BOOT button** on the board: **1 click** = ink and paper left. The board's light first shows green (plenty), yellow (getting low) or red (nearly out), then blinks the ink count in blue and the paper count in white: long blinks are tens, short blinks are ones, a quick flicker is a zero (52 = 5 long, 2 short). **2 clicks** = corner text on/off (green for on, red for off). **3 clicks** = next default printer (blue = SELPHY, yellow = label printer, purple = both). **Hold 5 seconds** = remove the page password (white).
+- **BOOT button** on the board: **1 click** = ink and paper left, shown on the board's light. Each count is a color held for 2 seconds, then blinks: the color is the tens (red = under 10, orange = 10s, yellow = 20s, green = 30s, cyan = 40s, blue = 50s, purple = 60 or more) and each blink is one more. So orange then 4 blinks = 14. Ink comes first, then two white flashes, then paper. A fast red flicker means none left. **2 clicks** = corner text on/off (green for on, red for off). **3 clicks** = next default printer (blue = SELPHY, yellow = label printer, purple = both). **Hold 5 seconds** = remove the page password (white).
 - **Touchscreen:** **Website** button in Settings.
 
 ## Touchscreen (optional)
