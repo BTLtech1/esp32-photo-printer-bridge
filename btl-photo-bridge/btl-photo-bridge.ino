@@ -57,7 +57,7 @@
 #include "btl_thermal.h"      // photos on thermal label / receipt printers
 #include "btl_watermark.h"    // website text in the corner of prints
 
-#define FW_VERSION    "0.10.6"
+#define FW_VERSION    "0.10.7"
 #define HOSTNAME      "btl-photo"
 #define FTP_PORT      21
 #define FTP_PASV_PORT 50021
@@ -333,6 +333,28 @@ static size_t spoolLimit() {
   }
   size_t m = ESP.getMaxAllocHeap();
   return m > 96 * 1024 ? min(m - 96 * 1024, (size_t)160 * 1024) : 0;
+}
+
+// Opening a network connection from a task whose stack is in PSRAM makes the Wi-Fi stack stop the bridge
+// ("assert failed: lwip_hook_tcp_isn"). Several of our tasks have PSRAM stacks (to spare internal memory),
+// so they open connections through a small helper task with a normal stack.
+#include "esp_memory_utils.h"
+#include "esp_cpu.h"
+struct ConnReq { WiFiClient* c; IPAddress ip; uint16_t port; uint32_t to; bool ok; SemaphoreHandle_t done; };
+static void connHelperTask(void* a) {
+  ConnReq* r = (ConnReq*)a;
+  r->ok = r->c->connect(r->ip, r->port, r->to);
+  xSemaphoreGive(r->done);
+  vTaskDelete(nullptr);
+}
+static bool netConnect(WiFiClient& c, IPAddress ip, uint16_t port, uint32_t timeoutMs) {
+  if (!esp_ptr_external_ram(esp_cpu_get_sp())) return c.connect(ip, port, timeoutMs);
+  ConnReq r = { &c, ip, port, timeoutMs, false, xSemaphoreCreateBinary() };
+  if (!r.done) return false;
+  bool ok = false;
+  if (xTaskCreatePinnedToCore(connHelperTask, "conn", 4096, &r, 2, nullptr, 1) == pdPASS) { xSemaphoreTake(r.done, portMAX_DELAY); ok = r.ok; }
+  vSemaphoreDelete(r.done);
+  return ok;
 }
 
 static size_t queueLen() {
@@ -1114,7 +1136,7 @@ static Client* printerConnect(WiFiClient& w, uint32_t timeoutMs) {
   if (usbIppReady()) { curUsb = true; return usbIpp.begin() ? (Client*)&usbIpp : nullptr; }
   curUsb = false;
   if (!printerFound) return nullptr;
-  if (!w.connect(printerIP, printerPort, timeoutMs)) return nullptr;
+  if (!netConnect(w, printerIP, printerPort, timeoutMs)) return nullptr;
   w.setNoDelay(true);
   return &w;
 }
@@ -2460,7 +2482,7 @@ static bool labelSend(const uint8_t* p, size_t n) {
   }
   if (!labelOk) return false;
   WiFiClient c;
-  if (!c.connect(labelIP, 9100, 3000)) { labelOk = false; blog("Label bridge %s stopped answering", labelHostName.c_str()); return false; }
+  if (!netConnect(c, labelIP, 9100, 3000)) { labelOk = false; blog("Label bridge %s stopped answering", labelHostName.c_str()); return false; }
   size_t done = 0;
   uint32_t t0 = millis();
   while (done < n && c.connected() && millis() - t0 < 20000) {
