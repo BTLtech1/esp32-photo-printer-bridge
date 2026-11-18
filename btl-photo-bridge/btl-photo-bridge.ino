@@ -389,19 +389,15 @@ static size_t queueLen() {
 }
 // Photos accepted in the last few minutes (name, time), to spot the camera re-sending one after a
 // dropped connection or being switched off before it heard "done".
-// Kept per camera (by its address), so two cameras that both send IMG_0042.JPG both get printed.
 struct RecentPhoto { String name; uint32_t at; };
 static std::vector<RecentPhoto> recentPhotos;
-static String curCam;                    // the camera whose photo is being received (set while it holds the transfer)
-static void markRecent(const String& n0) {
-  String n = curCam + "|" + n0;
+static void markRecent(const String& n) {
   xSemaphoreTake(dataMtx, portMAX_DELAY);
   recentPhotos.push_back({ n, millis() });
-  if (recentPhotos.size() > 40) recentPhotos.erase(recentPhotos.begin());
+  if (recentPhotos.size() > 20) recentPhotos.erase(recentPhotos.begin());
   xSemaphoreGive(dataMtx);
 }
-static bool sentRecently(const String& n0) {
-  String n = curCam + "|" + n0;
+static bool sentRecently(const String& n) {
   bool f = false;
   xSemaphoreTake(dataMtx, portMAX_DELAY);
   for (auto& r : recentPhotos) if (r.name == n && millis() - r.at < 180000) { f = true; break; }
@@ -2845,23 +2841,9 @@ static String ftpStor(Client& d, const String& path) {
   return "451 Printer busy, try again";
 }
 
-// Several cameras can be connected at once (MAX_CAMERAS). Each has its own session, but photos come in one at a
-// time: a camera takes camXferMtx when it asks for the data link (PASV/EPSV, or STOR in active mode) and gives it
-// back when its photo is in. Another camera asking meanwhile simply waits a few seconds for its answer.
-#define MAX_CAMERAS 3
-static SemaphoreHandle_t camXferMtx = nullptr;
-static volatile int camSessions = 0;
-
 static void ftpSession(WiFiClient& c) {
   c.setNoDelay(true);
-  String camIp = c.remoteIP().toString();
-  bool hold = false;                                   // this camera holds the data link
-  auto acquire = [&]() -> bool {
-    if (!hold && xSemaphoreTake(camXferMtx, pdMS_TO_TICKS(45000)) == pdTRUE) { hold = true; curCam = camIp; }
-    return hold;
-  };
-  auto release = [&]() { if (hold) { curCam = ""; hold = false; xSemaphoreGive(camXferMtx); } };
-  blog("Camera connected (%s)%s", camIp.c_str(), camSessions > 1 ? " - another camera is connected too" : "");
+  blog("Camera connected (%s)", c.remoteIP().toString().c_str());
   ftpSend(c, "220 BTL Photo Printer Bridge ready");
   uint32_t tStart = millis();          // timing of what the camera does before it sends (for the log)
   String trace;
@@ -2870,10 +2852,7 @@ static void ftpSession(WiFiClient& c) {
   IPAddress aIP; uint16_t aPort = 0;
 
   while (c.connected()) {
-    if (!readLineT(c, line, hold ? 15000 : 900000)) {
-      if (hold && c.connected()) { flushPendingData(); release(); continue; }   // asked for the data link, then went quiet: let others in
-      break;
-    }
+    if (!readLineT(c, line, 900000)) break;
     line.trim();
     if (!line.length()) continue;
     int sp = line.indexOf(' ');
@@ -2909,15 +2888,13 @@ static void ftpSession(WiFiClient& c) {
     else if (cmd == "ALLO") ftpSend(c, "202 OK");
     else if (cmd == "REST") ftpSend(c, arg.toInt() == 0 ? "350 OK" : "502 Resume not supported");
     else if (cmd == "PASV") {
-      if (!acquire()) { ftpSend(c, "421 Busy with another camera, try again"); continue; }
       active = false; flushPendingData();
       IPAddress ip = c.localIP();                 // the bridge's address on whichever network the camera came in on
       char b[80];
       snprintf(b, sizeof(b), "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u)", ip[0], ip[1], ip[2], ip[3], FTP_PASV_PORT >> 8, FTP_PASV_PORT & 0xFF);
       ftpSend(c, b);
     }
-    else if (cmd == "EPSV") { if (!acquire()) { ftpSend(c, "421 Busy with another camera, try again"); continue; }
-                              active = false; flushPendingData(); ftpSend(c, "229 Entering Extended Passive Mode (|||" + String(FTP_PASV_PORT) + "|)"); }
+    else if (cmd == "EPSV") { active = false; flushPendingData(); ftpSend(c, "229 Entering Extended Passive Mode (|||" + String(FTP_PASV_PORT) + "|)"); }
     else if (cmd == "PORT") {
       int v0, v1, v2, v3, v4, v5;
       if (sscanf(arg.c_str(), "%d,%d,%d,%d,%d,%d", &v0, &v1, &v2, &v3, &v4, &v5) == 6) {
@@ -2932,59 +2909,30 @@ static void ftpSession(WiFiClient& c) {
     }
     else if (cmd == "LIST" || cmd == "NLST" || cmd == "MLSD") {
       CamData& d = camData;
-      if (!acquire()) { ftpSend(c, "425 Busy with another camera, try again"); continue; }
       if (!openData(d, active, aIP, aPort)) ftpSend(c, active ? "425 Use passive mode" : "425 No data connection");
       else { ftpSend(c, "150 Listing"); d.stop(); ftpSend(c, "226 Done"); }
-      release();
     }
     else if (cmd == "STOR" || cmd == "APPE" || cmd == "STOU") {
       CamData& d = camData;
-      if (!acquire()) { ftpSend(c, "425 Busy with another camera, try again"); continue; }
-      if (!openData(d, active, aIP, aPort)) { ftpSend(c, active ? "425 Use passive mode" : "425 No data connection"); release(); continue; }
-      if (camSessions > 1) blog("Photo coming from camera %s", camIp.c_str());
+      if (!openData(d, active, aIP, aPort)) { ftpSend(c, active ? "425 Use passive mode" : "425 No data connection"); continue; }
       blog("Camera timing (ms): %sdata@%lu", trace.c_str(), (unsigned long)(millis() - tStart));
       ftpSend(c, "150 Ready to receive");
       String r = ftpStor(d, arg.length() ? arg : String("photo.jpg"));
       trace = ""; tStart = millis();
       d.stop();
-      release();
       ftpSend(c, r);
     }
     else if (cmd == "STAT") ftpSend(c, "211 BTL Photo Printer Bridge");
     else ftpSend(c, "502 Not implemented");
   }
-  if (hold) { flushPendingData(); release(); }
-  if (trace.length()) blog("Camera %s disconnected without sending; it did: %s", camIp.c_str(), trace.c_str());
-  else blog("Camera %s disconnected", camIp.c_str());
+  if (trace.length()) blog("Camera disconnected without sending; it did: %s", trace.c_str());
+  else blog("Camera disconnected");
 }
 
-struct CamSlot { TaskHandle_t h; WiFiClient* c; volatile bool done; };
-static CamSlot camSlots[MAX_CAMERAS];
-static void camSessionTask(void* arg) {
-  CamSlot* sl = (CamSlot*)arg;
-  ftpSession(*sl->c);
-  sl->c->stop();
-  sl->done = true;
-  vTaskSuspend(nullptr);                               // ftpTask frees this task (its stack is in PSRAM)
-}
 static void ftpTask(void*) {
   for (;;) {
-    for (CamSlot& sl : camSlots)                       // tidy up cameras that left
-      if (sl.h && sl.done && eTaskGetState(sl.h) == eSuspended) {
-        vTaskDeleteWithCaps(sl.h); delete sl.c; sl.h = nullptr; sl.c = nullptr; sl.done = false; camSessions--;
-      }
     WiFiClient c = SRV_ACCEPT(ftpCtl);
-    if (c) {
-      CamSlot* fr = nullptr;
-      for (CamSlot& sl : camSlots) if (!sl.h) { fr = &sl; break; }
-      if (!fr) { c.print("421 Too many cameras connected\r\n"); c.stop(); blog("A camera was turned away: %d are connected already", MAX_CAMERAS); }
-      else {
-        fr->c = new WiFiClient(c); fr->done = false; camSessions++;
-        if (xTaskCreatePinnedToCoreWithCaps(camSessionTask, "cam", 16384, fr, 1, &fr->h, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-          blog("No memory for another camera connection"); fr->c->stop(); delete fr->c; fr->c = nullptr; fr->h = nullptr; camSessions--;
-        }
-      }
-    }
+    if (c) { ftpSession(c); c.stop(); }
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
@@ -3615,7 +3563,7 @@ static void handlePreviewDone() {
 static void startAccessPoint() {
   if (!apOn) { WiFi.softAPdisconnect(true); return; }
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(apSsid.c_str(), apPass.length() >= 8 ? apPass.c_str() : nullptr, 1, 0, 6);   // up to 6 devices: cameras, a label bridge, your phone
+  WiFi.softAP(apSsid.c_str(), apPass.length() >= 8 ? apPass.c_str() : nullptr, 1, 0, 4);
 }
 
 static void handleApSettings() {
@@ -3945,8 +3893,7 @@ void setup() {
   server.begin();
 
   xTaskCreatePinnedToCoreWithCaps(printTask, "print", 12288, nullptr, 1, nullptr, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  camXferMtx = xSemaphoreCreateMutex();
-  xTaskCreatePinnedToCoreWithCaps(ftpTask, "ftp", 8192, nullptr, 1, nullptr, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  xTaskCreatePinnedToCoreWithCaps(ftpTask, "ftp", 16384, nullptr, 1, nullptr, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
 void loop() {

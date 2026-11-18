@@ -51,8 +51,6 @@ In the camera's network menu, create an **FTP transfer** connection. For the Wi-
 
 Then in **FTP transfer settings**: Automatic transfer **Disable**, Transfer with SET **Enable**, and send **JPEG** only. Press **Playback**, pick a photo, press **SET**.
 
-**More than one camera:** up to three cameras can be connected at once, each set up the same way. Photos come in one at a time, so a camera that sends while another is sending just waits a few seconds. Photos with the same file name from different cameras both print.
-
 On the BTL-Photo network the address never changes. If you use your home Wi-Fi instead, reserve the bridge's IP address in your router.
 
 ## Printing over USB
